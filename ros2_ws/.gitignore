@@ -1,0 +1,4 @@
+# colcon build artifacts (generated inside the container via build_ws)
+/build/
+/install/
+/log/

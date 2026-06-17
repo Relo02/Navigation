@@ -1,0 +1,204 @@
+# syntax=docker/dockerfile:1
+#
+# AMO RL gait deployment image for the Unitree G1, built around the RoboJuDo
+# framework (policy/RoboJuDo) and real_g1_walking_policy.py.
+#
+# This is NOT a ROS 2 image. The AMO policy talks to the robot directly over
+# CycloneDDS via unitree_sdk2py — ROS 2 is not required (see policy/README.md).
+# It bundles:
+#   - Python 3.11           (RoboJuDo requires-python >= 3.11)
+#   - a CPU build of torch  (deployment box has no CUDA)
+#   - RoboJuDo's Python deps (mujoco is mandatory: G1RealEnvCfg.update_with_fk)
+#   - Eclipse Cyclone DDS C library, built from source
+#   - unitree_sdk2py (Unitree DDS bindings) from GitHub
+#
+# Build:
+#   docker build -t g1-amo-policy:latest -f docker/Dockerfile.amo_policy docker/
+#
+# Run (bind-mount the source tree that holds policy/real_g1_walking_policy.py
+# and policy/RoboJuDo, then forward args to the script):
+#   docker run --rm -it --network host --ipc host \
+#       -e UNITREE_NET_IFACE=eth0 \
+#       -v /path/to/source:/workspace:rw \
+#       g1-amo-policy:latest --observe_only
+
+FROM python:3.11-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
+
+SHELL ["/bin/bash", "-c"]
+
+# System packages:
+#  - git, ca-certificates : pip / source installs from GitHub
+#  - build-essential, cmake: build Eclipse Cyclone DDS from source
+#  - iproute2, iputils-ping: debug `ip addr` / `ping` the robot
+#  - procps               : `ps`/`top` inside the container
+#  - libgl1, libglib2.0-0 : mujoco's mjcf parser pulls these
+#  - libgomp1, libstdc++6 : torch + cyclonedds native libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        ca-certificates \
+        build-essential \
+        cmake \
+        iproute2 \
+        iputils-ping \
+        procps \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip wheel setuptools
+
+# CPU build of torch first so the constraint resolves before the rest.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+# RoboJuDo runtime deps. Mirrors policy/RoboJuDo/requirements.txt with:
+#   - zmq        -> pyzmq        (correct PyPI name)
+#   - pynput / pygame dropped    (only RoboJuDo's keyboard / joystick
+#                                 controllers use them; this script never loads
+#                                 them, and pynput needs kernel headers).
+# websockets is added for the policy's :8766 state/command WebSocket server.
+# matplotlib backs the optional post-run trajectory / telemetry plots.
+RUN pip install \
+        numpy \
+        scipy \
+        onnxruntime \
+        joblib \
+        pyyaml \
+        easydict \
+        python-box \
+        tqdm \
+        pyzmq \
+        pydantic \
+        mujoco \
+        msgpack \
+        msgpack-numpy \
+        colorlog \
+        websockets \
+        matplotlib
+
+# ----------------------------------------------------------------------
+# Eclipse Cyclone DDS C library (built from source).
+# The cyclonedds==0.10.2 Python binding (a hard dep of unitree_sdk2py) is a
+# source distribution that needs the matching C library installed first.
+# Installing to /usr/local keeps the linker happy without LD_LIBRARY_PATH
+# gymnastics; CYCLONEDDS_HOME tells the binding where headers live.
+# ----------------------------------------------------------------------
+ARG CYCLONEDDS_REF=releases/0.10.x
+ENV CYCLONEDDS_HOME=/usr/local
+RUN git clone --depth 1 --branch "${CYCLONEDDS_REF}" \
+        https://github.com/eclipse-cyclonedds/cyclonedds.git /tmp/cyclonedds-src \
+    && cmake -S /tmp/cyclonedds-src -B /tmp/cyclonedds-build \
+        -DCMAKE_INSTALL_PREFIX="${CYCLONEDDS_HOME}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_IDLC=ON \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_TESTING=OFF \
+    && cmake --build /tmp/cyclonedds-build --target install -j"$(nproc)" \
+    && rm -rf /tmp/cyclonedds-src /tmp/cyclonedds-build \
+    && ldconfig
+
+# ----------------------------------------------------------------------
+# Unitree DDS bindings (unitree_sdk2py).
+# Import name is ``unitree_sdk2py``; the repo is ``unitree_sdk2_python``. It
+# pulls in ``cyclonedds==0.10.2`` transitively, which builds against the C
+# library above. Two upstream packaging bugs are worked around below.
+# init + shallow fetch (instead of clone --branch) so UNITREE_SDK_REF accepts
+# a branch, tag, OR commit SHA.
+# ----------------------------------------------------------------------
+ARG UNITREE_SDK_REF=master
+RUN mkdir -p /tmp/unitree_sdk2_python \
+    && cd /tmp/unitree_sdk2_python \
+    && git init -q \
+    && git remote add origin https://github.com/unitreerobotics/unitree_sdk2_python.git \
+    && git fetch --depth 1 origin "${UNITREE_SDK_REF}" \
+    && git -c advice.detachedHead=false checkout -q FETCH_HEAD \
+    # Bug 1: top-level __init__.py does ``from . import b2`` but b2/ (and g1,
+    # h1, h2, comm) ship without __init__.py. Touch any missing ones so all
+    # robot-family subpackages import as proper packages.
+    && find unitree_sdk2py -mindepth 1 -maxdepth 1 -type d \
+        -exec sh -c 'test -f "$1/__init__.py" || touch "$1/__init__.py"' _ {} \; \
+    && pip install . \
+    # Bug 2: setup.py omits package_data, so the CRC native libs in
+    # unitree_sdk2py/utils/lib/ never make it into the wheel. CRC().Crc()
+    # loads them via ctypes at send_cmd time; without this copy every
+    # published lowcmd raises "cannot open shared object file". Resolve SITE
+    # from /tmp (not cwd) so ``import unitree_sdk2py`` does not return the
+    # source tree we are about to delete.
+    && SITE=$(cd /tmp && python -c 'import unitree_sdk2py, os; print(os.path.dirname(unitree_sdk2py.__file__))') \
+    && echo "[unitree-fix] site-packages dir: ${SITE}" \
+    && mkdir -p "${SITE}/utils/lib" \
+    && cp unitree_sdk2py/utils/lib/*.so "${SITE}/utils/lib/" \
+    && cd / \
+    && rm -rf /tmp/unitree_sdk2_python
+
+# Smoke-test critical imports at build time so failures surface here, not on
+# the robot. Instantiate CRC() because its native lib is loaded lazily by
+# ctypes — bug 2 above would otherwise only fire at send_cmd time.
+RUN python - <<'PY'
+import importlib
+for mod in ("torch", "scipy", "numpy", "mujoco", "pydantic", "box",
+            "msgpack", "msgpack_numpy", "colorlog", "websockets",
+            "unitree_sdk2py", "cyclonedds"):
+    importlib.import_module(mod)
+from unitree_sdk2py.utils.crc import CRC
+CRC()
+print("import smoke OK (CRC native lib loaded)")
+PY
+
+# ----------------------------------------------------------------------
+# Runtime defaults. UNITREE_NET_IFACE selects the NIC CycloneDDS binds to;
+# override at run time, e.g. UNITREE_NET_IFACE=eth0. The inference code
+# (amo/) and the RoboJuDo framework are bind-mounted at run time (see
+# docker-compose.yml); override POLICY_SCRIPT / ROBOJUDO_ROOT / AMO_CONFIG_PATH
+# if your layout differs.
+# ----------------------------------------------------------------------
+ENV UNITREE_NET_IFACE=lo \
+    WORKSPACE=/workspace \
+    POLICY_SCRIPT=/workspace/amo/amo_inference.py \
+    ROBOJUDO_ROOT=/workspace/RoboJuDo \
+    AMO_CONFIG_PATH=/workspace/config/amo_g1.yaml
+
+# CYCLONEDDS_URI is built in the entrypoint so UNITREE_NET_IFACE can change at
+# run time. RoboJuDo is added to PYTHONPATH so ``import robojudo`` resolves.
+RUN cat > /usr/local/bin/amo_entrypoint.sh <<'EOF' && chmod +x /usr/local/bin/amo_entrypoint.sh
+#!/bin/bash
+set -e
+
+: "${UNITREE_NET_IFACE:=lo}"
+: "${ROBOJUDO_ROOT:=/workspace/policy/RoboJuDo}"
+: "${POLICY_SCRIPT:=/workspace/policy/real_g1_walking_policy.py}"
+
+# Honour an externally supplied CYCLONEDDS_URI (e.g. a mounted cyclonedds.xml);
+# otherwise synthesise one bound to UNITREE_NET_IFACE.
+if [ -z "${CYCLONEDDS_URI:-}" ]; then
+  export CYCLONEDDS_URI="<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${UNITREE_NET_IFACE}\" priority=\"default\" multicast=\"default\" /></Interfaces></General></Domain></CycloneDDS>"
+fi
+
+if [ -d "${ROBOJUDO_ROOT}" ]; then
+  export PYTHONPATH="${ROBOJUDO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
+# Bare shell / arbitrary command: run it as-is. Otherwise treat args as flags
+# for the policy script.
+if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ] && command -v "$1" >/dev/null 2>&1; then
+  exec "$@"
+fi
+
+exec python "${POLICY_SCRIPT}" "$@"
+EOF
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/amo_entrypoint.sh"]
+CMD ["--help"]

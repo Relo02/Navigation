@@ -1,0 +1,39 @@
+# AMO policy deployment config for the Unitree G1.
+# Read by amo/amo_inference.py. CLI flags and env vars override these values.
+# Mounted into the amo_policy container at /workspace/config/amo_g1.yaml
+# (env AMO_CONFIG_PATH points here).
+
+control:
+  freq_hz: 50          # control loop rate (the policy's native freq wins if set)
+  net_if: eth0         # CycloneDDS NIC to the robot (UNITREE_NET_IFACE overrides)
+  device: cpu          # torch device; deployment box is CPU-only
+  observe_only: false  # true = subscribe to DDS but never publish motor commands
+
+model:
+  # The AMO model is RoboJuDo torchscript (assets/models/g1/amo/amo_jit.pt +
+  # adapter + norm stats), loaded via RoboJuDo's AMOPolicy from this checkout.
+  robojudo_root: /workspace/RoboJuDo   # ROBOJUDO_ROOT env overrides
+  amo_pd_gains: true                   # overlay AMO-trained PD gains on env defaults
+
+activation:                # staged snap-free startup (filter layers A + B)
+  blend_s: 5.0             # A: S-curve pose blend, measured posture -> reference
+  gain_ramp_s: 2.0         # B: PD gains ramp soft -> full
+  kp_scale_start: 0.15     # B: initial fraction of full kp
+  kd_scale_start: 0.50     # B: initial fraction of full kd
+  stabilize_s: 10.0        # zero-command settle after standing, before walking
+  startup_command_ramp_s: 3.0  # ease the first velocity command in from zero
+  safety_tilt_rad: 0.6     # abort + damp if body tilt exceeds this
+  state_timeout_s: 0.5     # abort if no fresh LowState within this window
+
+filter:                    # layer D: optional running joint filter (off when kind=none)
+  kind: none           # none | ewma | critdamp
+  tau: 0.08                # ewma time constant (s) — used when kind=ewma
+  wn: 12.0                 # critdamp natural frequency (rad/s) — used when kind=critdamp
+  clamp_delta_rad: 0.05    # layer C: max per-joint change per control tick
+
+command:                   # velocity command source (vx, vy, yaw)
+  source: zero             # zero (stand) | constant | websocket
+  constant: [0.0, 0.0, 0.0]
+  max_forward_vel: 0.8     # rad/s and m/s caps used to normalise the command
+  max_yaw_rate: 0.4
+  websocket_port: 8766     # MPC /velocity_target interface when source=websocket

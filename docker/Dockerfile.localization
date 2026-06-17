@@ -1,0 +1,213 @@
+# syntax=docker/dockerfile:1
+
+FROM ros:humble-desktop
+
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-c"]
+
+# ----------------------------------------------------------------------
+# Base build tools + ROS 2 Humble dependencies
+# ----------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    make \
+    g++ \
+    gcc \
+    git \
+    wget \
+    curl \
+    unzip \
+    pkg-config \
+    vim \
+    nano \
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    tcpdump \
+    python3-pip \
+    python3-colcon-common-extensions \
+    python3-rosdep \
+    python3-vcstool \
+    python3-argcomplete \
+    libc++-dev \
+    libc++abi-dev \
+    libeigen3-dev \
+    libpcl-dev \
+    libgoogle-glog-dev \
+    libgflags-dev \
+    libboost-all-dev \
+    libyaml-cpp-dev \
+    libopencv-dev \
+    libomp-dev \
+    libx11-dev \
+    libxi-dev \
+    libxrandr-dev \
+    libxinerama-dev \
+    libxcursor-dev \
+    libglu1-mesa-dev \
+    mesa-common-dev \
+    ros-humble-rmw-cyclonedds-cpp \
+    ros-humble-tf2-ros \
+    ros-humble-tf2-geometry-msgs \
+    ros-humble-pcl-ros \
+    ros-humble-pcl-conversions \
+    ros-humble-cv-bridge \
+    ros-humble-image-transport \
+    ros-humble-nav-msgs \
+    ros-humble-sensor-msgs \
+    ros-humble-geometry-msgs \
+    ros-humble-visualization-msgs \
+    ros-humble-rviz2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rosdep init || true && rosdep update
+
+# ----------------------------------------------------------------------
+# Build Open3D 0.14.1 from source
+#
+# Installs to:
+#   /opt/open3d-0.14.1
+#
+# CMake package path:
+#   /opt/open3d-0.14.1/lib/cmake/Open3D
+# ----------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ninja-build \
+    clang \
+    libssl-dev \
+    libusb-1.0-0-dev \
+    libudev-dev \
+    libgl1-mesa-dev \
+    libglu1-mesa-dev \
+    libglew-dev \
+    libglfw3-dev \
+    libjsoncpp-dev \
+    libpng-dev \
+    libjpeg-dev \
+    libtiff-dev \
+    libtinyxml2-dev \
+    libqhull-dev \
+    libassimp-dev \
+    libfreetype6-dev \
+    libsdl2-dev \
+    libzmq3-dev \
+    libmsgpack-dev \
+    ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --recursive --branch v0.14.1 --depth 1 \
+      https://github.com/isl-org/Open3D.git /tmp/Open3D && \
+    cd /tmp/Open3D && \
+    mkdir -p build && cd build && \
+    cmake .. \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/open3d-0.14.1 \
+      -DBUILD_SHARED_LIBS=ON \
+      -DBUILD_PYTHON_MODULE=OFF \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_UNIT_TESTS=OFF \
+      -DBUILD_BENCHMARKS=OFF \
+      -DBUILD_CUDA_MODULE=OFF \
+      -DBUILD_GUI=OFF \
+      -DBUILD_WEBRTC=OFF \
+      -DUSE_SYSTEM_EIGEN3=ON \
+      -DUSE_SYSTEM_GLEW=ON \
+      -DUSE_SYSTEM_GLFW=ON \
+      -DUSE_SYSTEM_LIBPNG=ON \
+      -DUSE_SYSTEM_LIBJPEG=ON \
+      -DUSE_SYSTEM_TINYXML2=ON \
+      -DUSE_SYSTEM_QHULL=ON && \
+    ninja -j"$(nproc)" && \
+    ninja install && \
+    ldconfig && \
+    rm -rf /tmp/Open3D
+
+ENV Open3D_DIR=/opt/open3d-0.14.1/lib/cmake/Open3D
+ENV CMAKE_PREFIX_PATH=/opt/open3d-0.14.1:${CMAKE_PREFIX_PATH}
+ENV LD_LIBRARY_PATH=/opt/open3d-0.14.1/lib:${LD_LIBRARY_PATH}
+
+# ----------------------------------------------------------------------
+# Install Livox-SDK
+# Required by older Livox ROS driver / FAST-LIO setups
+# ----------------------------------------------------------------------
+RUN git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK.git /tmp/Livox-SDK && \
+    cd /tmp/Livox-SDK && \
+    mkdir -p build && cd build && \
+    cmake .. && \
+    make -j"$(nproc)" && \
+    make install && \
+    ldconfig && \
+    rm -rf /tmp/Livox-SDK
+
+# ----------------------------------------------------------------------
+# Install Livox-SDK2
+# Required for MID-360 / newer Livox devices
+# ----------------------------------------------------------------------
+RUN git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-SDK2 && \
+    cd /tmp/Livox-SDK2 && \
+    mkdir -p build && cd build && \
+    cmake .. && \
+    make -j"$(nproc)" && \
+    make install && \
+    # livox_ros_driver2 (ROS2) links the SHARED lib via a REQUIRED find_library
+    # in /usr/local/lib; make sure it is there even if `make install` only
+    # shipped the static archive.
+    cp -f sdk_core/liblivox_lidar_sdk_shared.so /usr/local/lib/ 2>/dev/null || true && \
+    ldconfig && \
+    rm -rf /tmp/Livox-SDK2
+
+# Tell livox_ros_driver2's CMake where the baked-in SDK2 lives (it searches
+# ${LIVOX_SDK2_ROOT}/lib and ${LIVOX_SDK2_ROOT}/include, plus /usr/local/lib).
+ENV LIVOX_SDK2_ROOT=/usr/local
+
+# ----------------------------------------------------------------------
+# ROS 2 workspace
+#
+# The workspace is NOT cloned/built into the image — it is bind-mounted from
+# the host at run time (docker-compose.yml maps ./../ros2_ws -> /ws) so it is
+# locally editable. Build it once inside the container after first `up`:
+#
+#   docker compose run --rm localization bash
+#   # then, inside:
+#   build_ws          # convenience alias (rosdep + colcon, see below)
+#
+# Open3D and the Livox SDKs above are baked into the image (just installed
+# libs), so only the FAST-LIO colcon build happens at run time.
+# ----------------------------------------------------------------------
+
+# Convenience build helper baked into the image. Runs rosdep + colcon against
+# the mounted /ws, pointing CMake at the image's Open3D install.
+RUN cat > /usr/local/bin/build_ws <<'EOF' && chmod +x /usr/local/bin/build_ws
+#!/bin/bash
+set -e
+source /opt/ros/humble/setup.bash
+cd /ws
+rosdep install --from-paths src --ignore-src -r -y --rosdistro humble || true
+# -DOpen3D_DIR: open3d_loc | -DROS_EDITION=ROS2: livox_ros_driver2 (ROS2 branch).
+# Both cmake vars are ignored by packages that don't use them.
+colcon build --symlink-install \
+    --cmake-args -DOpen3D_DIR=/opt/open3d-0.14.1/lib/cmake/Open3D -DROS_EDITION=ROS2
+echo "[build_ws] done — 'source /ws/install/setup.bash' (new shells do this automatically)"
+EOF
+
+# ----------------------------------------------------------------------
+# Runtime environment
+# ----------------------------------------------------------------------
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ENV ROS_DOMAIN_ID=0
+
+# Source the workspace overlay only if it has been built (guarded so a fresh
+# shell before the first build_ws doesn't error).
+RUN echo 'source /opt/ros/humble/setup.bash' >> /root/.bashrc && \
+    echo '[ -f /ws/install/setup.bash ] && source /ws/install/setup.bash' >> /root/.bashrc && \
+    echo 'export Open3D_DIR=/opt/open3d-0.14.1/lib/cmake/Open3D' >> /root/.bashrc && \
+    echo 'export CMAKE_PREFIX_PATH=/opt/open3d-0.14.1:${CMAKE_PREFIX_PATH}' >> /root/.bashrc && \
+    echo 'export LD_LIBRARY_PATH=/opt/open3d-0.14.1/lib:${LD_LIBRARY_PATH}' >> /root/.bashrc && \
+    echo 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp' >> /root/.bashrc && \
+    echo 'export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}' >> /root/.bashrc
+
+WORKDIR /ws
+
+CMD ["/bin/bash"]

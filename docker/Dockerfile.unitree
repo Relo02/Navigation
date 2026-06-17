@@ -1,0 +1,139 @@
+# syntax=docker/dockerfile:1
+
+FROM ros:humble-desktop
+
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-c"]
+
+# ----------------------------------------------------------------------
+# Base tools + ROS 2 Humble + Unitree/CycloneDDS dependencies
+# ----------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    g++ \
+    make \
+    git \
+    wget \
+    curl \
+    vim \
+    nano \
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    tcpdump \
+    python3-pip \
+    python3-colcon-common-extensions \
+    python3-rosdep \
+    python3-vcstool \
+    python3-argcomplete \
+    libyaml-cpp-dev \
+    libeigen3-dev \
+    libboost-all-dev \
+    libspdlog-dev \
+    libfmt-dev \
+    ros-humble-rmw-cyclonedds-cpp \
+    ros-humble-rosidl-generator-dds-idl \
+    ros-humble-domain-bridge \
+    ros-humble-robot-state-publisher \
+    ros-humble-joint-state-publisher \
+    ros-humble-joint-state-publisher-gui \
+    ros-humble-xacro \
+    ros-humble-tf2-ros \
+    ros-humble-tf2-tools \
+    ros-humble-rviz2 \
+    ros-humble-teleop-twist-keyboard \
+    ros-humble-joy \
+    ros-humble-joy-teleop \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rosdep init || true && rosdep update
+
+# ----------------------------------------------------------------------
+# DDS defaults for Unitree robots
+#
+# Override UNITREE_NET_IFACE at runtime, e.g.
+#   UNITREE_NET_IFACE=enp3s0 docker compose up unitree_g1
+# ----------------------------------------------------------------------
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ENV ROS_DOMAIN_ID=0
+ENV UNITREE_NET_IFACE=lo
+
+# CYCLONEDDS_URI is set dynamically in the entrypoint so UNITREE_NET_IFACE
+# can be changed at docker-compose runtime.
+RUN cat > /usr/local/bin/unitree_entrypoint.sh <<'EOF' && chmod +x /usr/local/bin/unitree_entrypoint.sh
+#!/bin/bash
+set -e
+
+: "${UNITREE_NET_IFACE:=lo}"
+: "${ROS_DOMAIN_ID:=0}"
+
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID}"
+
+export CYCLONEDDS_URI="<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${UNITREE_NET_IFACE}\" priority=\"default\" multicast=\"default\" /></Interfaces></General></Domain></CycloneDDS>"
+
+source /opt/ros/humble/setup.bash
+
+if [ -f /opt/unitree_ros2/cyclonedds_ws/install/setup.bash ]; then
+  source /opt/unitree_ros2/cyclonedds_ws/install/setup.bash
+fi
+
+if [ -f /opt/unitree_ros2/example/install/setup.bash ]; then
+  source /opt/unitree_ros2/example/install/setup.bash
+fi
+
+exec "$@"
+EOF
+
+# ----------------------------------------------------------------------
+# Build and install Unitree SDK2
+# ----------------------------------------------------------------------
+WORKDIR /opt
+
+RUN git clone --depth 1 https://github.com/unitreerobotics/unitree_sdk2.git /opt/unitree_sdk2 && \
+    cd /opt/unitree_sdk2 && \
+    mkdir -p build && cd build && \
+    cmake .. && \
+    make -j"$(nproc)" && \
+    make install && \
+    ldconfig
+
+# ----------------------------------------------------------------------
+# Clone and build Unitree ROS 2 packages
+#
+# Repo layout:
+#   /opt/unitree_ros2/cyclonedds_ws
+#   /opt/unitree_ros2/example
+#
+# For Humble, Unitree says the separate CycloneDDS source compilation step
+# can be skipped, but the Unitree message packages still need to be built.
+# ----------------------------------------------------------------------
+RUN git clone --depth 1 https://github.com/unitreerobotics/unitree_ros2.git /opt/unitree_ros2
+
+WORKDIR /opt/unitree_ros2/cyclonedds_ws
+
+RUN source /opt/ros/humble/setup.bash && \
+    rosdep install --from-paths src --ignore-src -r -y --rosdistro humble || true && \
+    colcon build --symlink-install
+
+WORKDIR /opt/unitree_ros2/example
+
+RUN source /opt/ros/humble/setup.bash && \
+    source /opt/unitree_ros2/cyclonedds_ws/install/setup.bash && \
+    rosdep install --from-paths src --ignore-src -r -y --rosdistro humble || true && \
+    colcon build --symlink-install
+
+# ----------------------------------------------------------------------
+# Convenience shell setup
+# ----------------------------------------------------------------------
+RUN echo 'source /opt/ros/humble/setup.bash' >> /root/.bashrc && \
+    echo 'source /opt/unitree_ros2/cyclonedds_ws/install/setup.bash' >> /root/.bashrc && \
+    echo 'source /opt/unitree_ros2/example/install/setup.bash' >> /root/.bashrc && \
+    echo 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp' >> /root/.bashrc && \
+    echo 'export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}' >> /root/.bashrc
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/unitree_entrypoint.sh"]
+CMD ["/bin/bash"]

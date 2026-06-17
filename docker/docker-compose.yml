@@ -1,0 +1,87 @@
+# Navigation stack — three decoupled images (see ../docs/dockerfiles.md).
+# Run a single service, e.g.:
+#   UNITREE_NET_IFACE=eth0 docker compose up amo_policy
+#
+# amo_policy defaults to `bash` (no motors move on `up`); start inference with:
+#   docker compose run --rm amo_policy \
+#       python /workspace/amo/amo_inference.py --config /workspace/config/amo_g1.yaml
+
+services:
+  amo_policy:
+    build:
+      context: .
+      dockerfile: Dockerfile.amo_policy
+    image: amo-policy-runtime:humble
+    container_name: amo_policy
+    network_mode: host
+    ipc: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ${DISPLAY}
+      QT_X11_NO_MITSHM: "1"
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      UNITREE_NET_IFACE: ${UNITREE_NET_IFACE:-lo}
+      # AMO inference paths (consumed by amo/amo_inference.py via the entrypoint).
+      ROBOJUDO_ROOT: /workspace/RoboJuDo
+      AMO_CONFIG_PATH: /workspace/config/amo_g1.yaml
+      AMO_POLICY_PATH: /workspace/policies/amo_policy.onnx
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./shared:/workspace/shared
+      - ./policies:/workspace/policies
+      - ./config:/workspace/config
+      # Inference code + the RoboJuDo framework (the symlink target is resolved
+      # here so `import robojudo` works inside the container).
+      - ../amo:/workspace/amo
+      - ../../RoboJuDo:/workspace/RoboJuDo:ro
+    command: bash
+
+  unitree:
+    build:
+      context: .
+      dockerfile: Dockerfile.unitree
+    image: unitree-runtime:humble
+    container_name: unitree
+    network_mode: host
+    ipc: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ${DISPLAY}
+      QT_X11_NO_MITSHM: "1"
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      UNITREE_NET_IFACE: ${UNITREE_NET_IFACE:-lo}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./shared:/workspace/shared
+    command: bash
+
+  localization:
+    build:
+      context: .
+      dockerfile: Dockerfile.localization
+    image: localization-runtime:humble
+    container_name: localization
+    network_mode: host
+    ipc: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ${DISPLAY}
+      QT_X11_NO_MITSHM: "1"
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./shared:/workspace/shared
+      - ./config:/workspace/config
+      # Locally-editable FAST-LIO workspace. Build once inside the container
+      # with `build_ws` (rosdep + colcon); install/ + build/ persist on the host.
+      - ../ros2_ws:/ws
+    command: bash
