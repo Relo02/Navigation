@@ -83,7 +83,6 @@ class IsaacDlioQosRelay(Node):
             Imu, str(self.get_parameter('imu_in_topic').value),
             self._imu_cb, be_qos)
 
-        self._warned_empty = False
         self.get_logger().info(
             f'Isaac->DLIO QoS relay: PointCloud2 -> {out_topic!r} (RELIABLE), '
             f'IMU -> {imu_out_topic!r} (RELIABLE); stride={self._stride}'
@@ -94,12 +93,13 @@ class IsaacDlioQosRelay(Node):
         self._imu_pub.publish(msg)
 
     def _cloud_cb(self, msg: PointCloud2) -> None:
-        if self._stride <= 1:
-            # Fast path: forward the cloud verbatim, only the QoS changes.
-            self._cloud_pub.publish(msg)
-            return
-
-        # Decimation requested: rebuild an XYZ cloud keeping every Nth point.
+        # Always rebuild a clean, finite XYZ cloud. Isaac's RTX lidar keeps
+        # no-return rays as NaN/Inf points; forwarding them verbatim makes DLIO's
+        # removeNaN + crop empty the scan (deskewed points: 0) and then heap-crash
+        # on the empty cloud ('free(): invalid next size'). Stripping non-finite
+        # points here gives DLIO the same valid-returns-only cloud the real Livox
+        # driver emits (XYZ is all the sim path needs: no per-point time -> DLIO
+        # auto-detects UNKNOWN and skips deskew).
         try:
             raw = point_cloud2.read_points(
                 msg, field_names=('x', 'y', 'z'), skip_nans=True)
@@ -108,11 +108,15 @@ class IsaacDlioQosRelay(Node):
                 f'cloud parse error: {exc}', throttle_duration_sec=5.0)
             return
         pts = np.column_stack((raw['x'], raw['y'], raw['z'])).astype(np.float32)
-        pts = pts[::self._stride]
+        # skip_nans drops NaN; also drop Inf (no-return rays at +inf range).
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if self._stride > 1:
+            pts = pts[::self._stride]
         if pts.shape[0] == 0:
-            if not self._warned_empty:
-                self.get_logger().warning('empty cloud -- nothing to forward')
-                self._warned_empty = True
+            # Never forward an empty cloud -- DLIO crashes on it. Just wait.
+            self.get_logger().warning(
+                'cloud has no finite points -- not forwarding (lidar sees nothing?)',
+                throttle_duration_sec=5.0)
             return
         self._cloud_pub.publish(point_cloud2.create_cloud_xyz32(msg.header, pts))
 

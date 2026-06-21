@@ -1,0 +1,36 @@
+# Local rolling 3D voxel map — parameters for local_voxel_map_node.
+# Feeds the a_star_mpc planner's gaussian backend (obstacle PointCloud2).
+# See docs/LOCAL_VOXEL_MAP.md for how the map is computed.
+
+/**:
+  ros__parameters:
+    # ── inputs (DLIO, odom frame) ──────────────────────────────────────────
+    cloud_topic: /dlio/odom_node/pointcloud/deskewed  # deskewed+registered scan (~10 Hz)
+    odom_topic:  /dlio/odom_node/odom                  # robot pose used to centre the window
+
+    # ── outputs ────────────────────────────────────────────────────────────
+    # Point the planner's `obstacle_topic` at <node>/obstacles (default
+    # /local_voxel_map/obstacles). ~ expands to the node-name namespace.
+    obstacles_topic: "~/obstacles"     # PointCloud2 of ground-removed obstacle voxels -> planner
+    voxel_topic:     "~/voxel_grid"    # PointCloud2 (same), for RViz / 3D queries
+    costmap_topic:   "~/costmap"       # OccupancyGrid 2D column projection
+
+    # ── rolling window / voxelisation ──────────────────────────────────────
+    half_width:    8.0    # local map half-extent (m); total window = 2*half_width
+    voxel_size:    0.10   # 3D voxel edge (m) — also the costmap resolution
+    persistence_s: 3.0    # voxel memory before temporal decay (s); densifies sparse MID-360
+
+    # ── ground removal (per-cell lowest-point segmentation, on accumulated cloud) ──
+    ground_cell:   0.25   # XY cell for local-ground estimation (m)
+    ground_thresh: 0.10   # height above local ground to count as obstacle (m)
+    max_height:    2.0    # ignore points more than this above local ground (m) — drops ceiling
+    # The DLIO odom origin sits at the sensor (~1 m above the floor), so z_below
+    # MUST reach BELOW the floor or ground segmentation has no ground reference
+    # and the floor leaks through as obstacles.
+    z_below:       1.5    # vertical crop below robot/sensor (m)
+    z_above:       1.5    # vertical crop above robot/sensor (m)
+    min_range:     0.4    # drop returns within this radius of the robot (self-hits) (m)
+
+    # ── costmap encoding ───────────────────────────────────────────────────
+    publish_costmap:    true
+    costmap_unknown_as: -1   # value for non-occupied cells: -1 unknown, 0 free

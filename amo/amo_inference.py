@@ -324,6 +324,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--vx", type=float, default=None, help="Constant forward velocity.")
     p.add_argument("--vy", type=float, default=None, help="Constant lateral velocity.")
     p.add_argument("--yaw", type=float, default=None, help="Constant yaw rate.")
+    p.add_argument("--command_source", default=None,
+                   choices=["zero", "constant", "websocket"],
+                   help="Override command.source (websocket = joystick via cmd_vel_to_amo).")
     return p.parse_args(argv)
 
 
@@ -345,6 +348,8 @@ def apply_overrides(cfg: dict, a: argparse.Namespace) -> dict:
         cfg["model"]["robojudo_root"] = a.robojudo_root
     if a.filter_kind is not None:
         cfg["filter"]["kind"] = a.filter_kind
+    if a.command_source is not None:
+        cfg["command"]["source"] = a.command_source
 
     if any(v is not None for v in (a.vx, a.vy, a.yaw)):
         cfg["_cli_const"] = (a.vx or 0.0, a.vy or 0.0, a.yaw or 0.0)

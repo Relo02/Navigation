@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>g1_local_map</name>
+  <version>0.1.0</version>
+  <description>
+    Local rolling 3D voxel map for G1 navigation. Consumes the DLIO deskewed,
+    registered point cloud (/dlio/odom_node/pointcloud/deskewed, odom frame,
+    ~10 Hz) plus DLIO odometry, removes the ground (per-cell lowest-point
+    segmentation on the temporally-accumulated cloud), and maintains a
+    robot-centred rolling voxel occupancy grid with decay. Publishes a
+    ground-removed obstacle PointCloud2 to feed the a_star_mpc planner's
+    gaussian backend, plus a sparse voxel-grid PointCloud2 and a 2D OccupancyGrid
+    costmap for visualization.
+  </description>
+  <maintainer email="lorenzo.ortolani@talosrobotics.ai">Lorenzo Ortolani</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>sensor_msgs_py</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>direct_lidar_inertial_odometry</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+</package>

@@ -176,27 +176,84 @@ fix is correct **before** any motion.
 
 ---
 
-## Phase 7 — Real robot: DLIO + AMO gait (the deployment goal)
+## Phase 7 — Real robot: DLIO + AMO gait, **teleoperated with the Unitree joystick** (the deployment goal)
 
-17. 🤖 Follow the **safe AMO activation sequence** (low-gain posture hold →
-    S-curve ramp to standing → gains soft→full → stabilize) — DLIO must
-    calibrate during the stationary stabilize hold, *before* the first walking
-    command.
-18. Walk slowly, then turn, then normal gait.
+Goal: drive the G1 around by hand with the Unitree gamepad while DLIO localizes
+and maps. The velocity-command path is the **same `/cmd_vel` pipeline used in
+sim**, with a WebSocket bridge into the (ROS-free) AMO container:
+
+```
+Unitree gamepad ──js0──> joy_node ──/joy──> joy_to_cmdvel ──/cmd_vel──> cmd_vel_to_amo ──ws:8766──> amo_inference ──DDS──> G1
+```
+
+All three containers use host networking, so DDS (domain 0) and the WebSocket
+(`127.0.0.1:8766`) are shared across them and the host. (In sim the Isaac
+`--stabilize` AMO loop subscribes `/cmd_vel` directly, so no bridge is needed —
+see [`simulation_stack.md`](simulation_stack.md).)
+
+**Prerequisites**
+- Phase 6 green: DLIO localizes stably while the robot stands.
+- The Unitree controller is paired to the PC as a standard gamepad — confirm
+  `ls /dev/input/js*` shows `js0`. The `localization` container is `privileged`,
+  so it already has device access; no extra mount needed.
+
+17. 📦 Start the real localization stack (Livox driver + DLIO + local map + RViz):
+    ```bash
+    ros2 launch g1_bringup real_localization.launch.py
+    ```
+    Keep the robot still for the first ~3 s (IMU + gravity calibration).
+
+18. 🤖 Start the AMO policy in **joystick (WebSocket) mode**. `JOYSTICK=1` makes
+    `run_amo.sh` both (a) launch the gamepad→`/cmd_vel`→WebSocket nodes detached
+    in the `localization` container (`real_teleop.launch.py`) and (b) run
+    `amo_inference` with `--command_source websocket`:
+    ```bash
+    NET_IF=<robot-nic> JOYSTICK=1 ./docker/run_amo.sh
+    ```
+    Equivalent manual form (two terminals) — useful for a held deadman:
+    ```bash
+    # amo_policy container — AMO listens for velocity on ws:8766:
+    NET_IF=<robot-nic> ./docker/run_amo.sh --command_source websocket
+    # localization container — gamepad -> /cmd_vel -> bridge:
+    ros2 launch g1_sim_bridge real_teleop.launch.py                 # always-on
+    ros2 launch g1_sim_bridge real_teleop.launch.py deadman_button:=4   # SAFER: hold LB to move
+    ```
+    The AMO **activation sequence runs automatically** (low-gain posture hold →
+    S-curve ramp to standing → gains soft→full → `stabilize_s` settle); the
+    velocity command is **held at zero** through that window and only eases in
+    afterwards, so DLIO calibrates during the stationary hold *before* the robot
+    can move. Do not touch the sticks until it logs the walk phase.
+
+19. Drive: **left stick** = translate (forward / strafe), **right stick X** =
+    turn. Start slow, then turning, then normal gait.
     **Pass:**
     - DLIO stays converged through gait impacts (no Z ramp, no per-step yaw
       creep); odometry matches the physical path on a known loop.
     - Returning to start closes the loop within a small drift.
-    - **Fail:** apply §2.1 (crop), §2.2 (calibration/gyro bias), §2.3 (geo gains)
-      in that order; re-verify a stationary run first after any change.
+    - The gamepad reliably drives `(vx, vy, yaw)` — verify with
+      `ros2 topic echo /cmd_vel` while moving the sticks. If signs feel mirrored,
+      flip `invert_vx/vy/yaw` on `joy_to_cmdvel` (axes follow the SDL/Xbox layout).
+    - **Fail (odometry):** apply §2.1 (crop — must remove the swinging arms),
+      §2.2 (calibration/gyro bias), §2.3 (geo gains) in that order; re-verify a
+      stationary run first after any change.
+
+**Stop / e-stop:** Ctrl-C `amo_inference` — it damps the motors on exit. Then
+stop the teleop nodes: `docker exec localization pkill -f real_teleop`.
 
 ---
 
 ## Phase 8 — Mapping & (future) map-based localization
 
-19. 🤖 Walk a full route and `save_pcd` the accumulated map (Phase 3 step 9).
+20. 🤖 Joystick the robot along a full route (close a loop if possible), then
+    `save_pcd` the accumulated map (same service as Phase 3 step 9):
+    ```bash
+    ros2 service call /save_pcd direct_lidar_inertial_odometry/srv/SavePCD \
+      "{leaf_size: 0.2, save_path: '/ws/maps/'}"
+    ```
+    Watch `/dlio/map_node/map` and `/local_voxel_map/*` grow coherently in RViz
+    as you drive.
     **Pass:** the saved map is metrically consistent with the environment.
-20. *(Deferred)* Map-based re-localization: DLIO has **no** prebuilt-map
+21. *(Deferred)* Map-based re-localization: DLIO has **no** prebuilt-map
     localization mode (only odometry + online map + `save_pcd`). If drift-free
     re-localization against a fixed map is later required, that is a separate
     add-on (e.g. a scan-to-map matcher) — not part of this stack today.
@@ -214,5 +271,5 @@ fix is correct **before** any motion.
 | 4 | **Sim + AMO gait: DLIO stays converged while walking** |
 | 5 | Real sensor: `/livox/imu` z ≈ −9.8, cloud has timestamps |
 | 6 | **Real, stationary: DLIO pose stable** |
-| 7 | **Real + AMO gait: DLIO converged on a known loop** |
+| 7 | **Real + joystick AMO gait: gamepad drives `/cmd_vel`, DLIO converged on a known loop** |
 | 8 | Map saved + metrically consistent |

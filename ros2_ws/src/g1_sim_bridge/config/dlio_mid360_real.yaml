@@ -40,3 +40,13 @@
                                    0., 0., 1. ]
 
     pointcloud/deskew: true
+
+    # Estimate the gravity DIRECTION from the averaged at-rest accel during the
+    # startup calibration and set the initial attitude from it, instead of
+    # blindly assuming base_link +z is up at exactly 9.8 m/s^2 (the vendored
+    # default sets this false). With the inverted MID-360 IMU this is the robust
+    # choice: any residual mount tilt / sign ambiguity is absorbed into the
+    # initial orientation rather than left to leak into the vertical channel,
+    # where the geometric observer chases it into the accel-bias cap
+    # (abias_max) and the Z velocity/position diverge until DLIO crashes.
+    odom/imu/approximateGravity: true

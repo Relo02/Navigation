@@ -21,6 +21,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCENE="$SCRIPT_DIR/g1_sim_scene.py"
 
+# --teleop[=keyboard|joystick|none]: how to send /cmd_vel references to the AMO
+# gait (only meaningful with --stabilize). Parsed out here so it is NOT forwarded
+# to the Isaac scene. keyboard (default) just prints the command to run in the
+# localization container; joystick backgrounds the gamepad nodes there.
+TELEOP=""
+SCENE_ARGS=()
+for _a in "$@"; do
+    case "$_a" in
+        --teleop)    TELEOP="keyboard" ;;
+        --teleop=*)  TELEOP="${_a#*=}" ;;
+        *)           SCENE_ARGS+=("$_a") ;;
+    esac
+done
+set -- "${SCENE_ARGS[@]+"${SCENE_ARGS[@]}"}"
+
 # Isaac Sim lives in the g1-isaac-sim repo (not in Navigation). Override with
 # ISAAC_SIM_PATH if your install is elsewhere.
 ISAAC_DIR="${ISAAC_SIM_PATH:-/home/lorenzo/TalosRoboticsAI/g1/g1-isaac-sim/isaac-sim}"
@@ -79,6 +94,27 @@ if [[ -d "$ISAAC_LIDAR_CFG_DIR" ]]; then
         || echo "[launch] WARNING: could not link MID-360 profile into $ISAAC_LIDAR_CFG_DIR" >&2
 fi
 
+# Reference-command teleop for --stabilize. Isaac runs in the foreground below,
+# so the gamepad nodes (non-interactive) are backgrounded in the localization
+# container; the keyboard (needs its own TTY) is left for the user to run.
+case "${TELEOP}" in
+    joystick)
+        LOC_SVC="${LOCALIZATION_CONTAINER:-localization}"
+        echo "[launch] --teleop=joystick: starting gamepad nodes in '${LOC_SVC}' ..."
+        docker exec -d "${LOC_SVC}" bash -lc \
+            'source /opt/ros/humble/setup.bash && source /ws/install/setup.bash && \
+             exec ros2 launch g1_sim_bridge joystick.launch.py' \
+            && echo "[launch] joystick teleop running (stop: docker exec ${LOC_SVC} pkill -f joy)" \
+            || echo "[launch] WARNING: could not start joystick in '${LOC_SVC}'" >&2
+        ;;
+    keyboard)
+        echo "[launch] --teleop=keyboard: in the localization container run ->"
+        echo "[launch]   ros2 run teleop_twist_keyboard teleop_twist_keyboard"
+        ;;
+    ""|none) : ;;
+    *) echo "[launch] WARNING: unknown --teleop='${TELEOP}' (use keyboard|joystick|none)" >&2 ;;
+esac
+
 echo "[launch] ROS_DISTRO=$ROS_DISTRO  RMW=$RMW_IMPLEMENTATION  ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
 echo "[launch] starting Isaac Sim (G1 + MID-360 + IMU -> ROS 2)..."
-exec "$ISAAC_DIR/python.sh" "$SCENE" "$@"
+exec "$ISAAC_DIR/python.sh" "$SCENE" "${SCENE_ARGS[@]+"${SCENE_ARGS[@]}"}"

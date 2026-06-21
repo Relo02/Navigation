@@ -18,6 +18,10 @@ Run Isaac first (Navigation/sim/launch_g1_sim.sh), then:
 
     ros2 launch g1_sim_bridge sim_localization.launch.py
     ros2 launch g1_sim_bridge sim_localization.launch.py start_dlio:=false   # relay only
+    ros2 launch g1_sim_bridge sim_localization.launch.py rviz:=false         # no RViz
+
+RViz opens by default with the shared g1_dlio.rviz config (from g1_bringup),
+with use_sim_time=true so it follows Isaac's /clock.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
@@ -32,6 +36,8 @@ def generate_launch_description():
     start_dlio = LaunchConfiguration('start_dlio')
     use_sim_time = LaunchConfiguration('use_sim_time')
     stride = LaunchConfiguration('stride')
+    rviz = LaunchConfiguration('rviz')
+    robot_model = LaunchConfiguration('robot_model')
 
     declare_start_dlio = DeclareLaunchArgument(
         'start_dlio', default_value='true',
@@ -42,6 +48,12 @@ def generate_launch_description():
     declare_stride = DeclareLaunchArgument(
         'stride', default_value='1',
         description='Relay decimation: keep every Nth cloud point (1 = all)')
+    declare_rviz = DeclareLaunchArgument(
+        'rviz', default_value='true',
+        description='Open RViz with the shared g1_dlio.rviz config (use_sim_time=true)')
+    declare_robot_model = DeclareLaunchArgument(
+        'robot_model', default_value='true',
+        description='Publish the G1 URDF model (robot_state_publisher) so RViz shows the robot')
 
     relay_node = Node(
         package='g1_sim_bridge',
@@ -71,10 +83,42 @@ def generate_launch_description():
         condition=IfCondition(start_dlio),
     )
 
+    # RViz with the shared DLIO view (g1_bringup/rviz/g1_dlio.rviz). Sim variant
+    # forces use_sim_time=true so displays follow Isaac's /clock (the real-robot
+    # launch sets it false). FindPackageShare resolves g1_bringup from the same
+    # workspace -- no build dependency needed for a launch substitution.
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz_dlio',
+        arguments=['-d', PathJoinSubstitution(
+            [FindPackageShare('g1_bringup'), 'rviz', 'g1_dlio.rviz'])],
+        parameters=[{'use_sim_time': use_sim_time}],
+        condition=IfCondition(rviz),
+        output='screen',
+    )
+
+    # G1 URDF model -> /robot_description + link TFs, riding DLIO's base_link
+    # pose. Isaac publishes the live /joint_states (g1_sim_scene.py), so the
+    # neutral joint_state_publisher is disabled here.
+    robot_model_inc = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            FindPackageShare('g1_bringup'), '/launch/robot_model.launch.py']),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'use_joint_state_publisher': 'false',
+        }.items(),
+        condition=IfCondition(robot_model),
+    )
+
     return LaunchDescription([
         declare_start_dlio,
         declare_use_sim_time,
         declare_stride,
+        declare_rviz,
+        declare_robot_model,
         relay_node,
         dlio,
+        rviz_node,
+        robot_model_inc,
     ])

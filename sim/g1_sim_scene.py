@@ -30,11 +30,16 @@ import sys
 # CLI -- parsed before SimulationApp so --headless can be honoured.
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# The saved G1 stage lives in the g1-isaac-sim repo (not in Navigation).
+# The G1 + full-warehouse stage now lives inside this repo (sim/usd/). It is a
+# thin wrapper: /World/g1 is a *payload* to the cloud G1 robot
+# (.../Isaac/5.1/Isaac/Robots/Unitree/G1/g1.usd) and /World/full_warehouse pulls
+# the warehouse environment from the Isaac cloud assets -- so the .usd file is
+# self-contained (no local sibling assets) and carries NO embedded ROS graphs;
+# this script adds the MID-360 lidar + IMU + ROS publishers itself.
 # Override with --usd or the ISAAC_G1_STAGE env var.
 _DEFAULT_USD = os.environ.get(
     "ISAAC_G1_STAGE",
-    "/home/lorenzo/TalosRoboticsAI/g1/g1-isaac-sim/isaac_projects/g1_basic_world.usd",
+    os.path.join(_HERE, "usd", "robot_full_warehouse.usd"),
 )
 
 parser = argparse.ArgumentParser(description="G1 + MID-360 + IMU -> ROS 2 sim")
@@ -51,12 +56,19 @@ parser.add_argument("--lidar-topic", default="/livox/lidar")
 parser.add_argument("--imu-topic", default="/livox/imu_raw")
 parser.add_argument("--frame-id", default="livox_frame")
 parser.add_argument("--clock-topic", default="/clock")
+parser.add_argument("--joint-states-topic", default="/joint_states",
+                    help="G1 articulation joint angles -> URDF robot_state_publisher in RViz")
 # The G1 is unactuated in this scene -- with physics on and no controller it
 # sags/collapses under gravity and DLIO tracks the falling sensor (Z drifts).
 # --hold-pose pins the pelvis to the world (fixed base) so the robot stays put
 # for a clean static localization test. Turn OFF once AMO drives the joints.
 parser.add_argument("--hold-pose", action="store_true",
                     help="Pin the pelvis to the world (fixed base) so the unactuated G1 doesn't collapse")
+parser.add_argument("--stabilize", action="store_true",
+                    help="Run the Navigation AMO policy (amo/AmoDeployment) so the G1 actively "
+                         "stands and stays still. Mutually exclusive with --hold-pose.")
+parser.add_argument("--robot-prim", default="/World/g1",
+                    help="Articulation root prim for --stabilize (the G1 articulation)")
 parser.add_argument("--robot-root", default="/World/g1/pelvis",
                     help="Robot root link prim to pin when --hold-pose is set")
 # MID-360 is mounted upside-down on the real G1, but the livox driver already
@@ -86,7 +98,34 @@ import omni.replicator.core as rep  # noqa: E402
 from isaacsim.core.api import SimulationContext  # noqa: E402
 from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
 from isaacsim.core.utils.prims import set_targets  # noqa: E402
-from pxr import Gf, Sdf, UsdGeom, UsdPhysics  # noqa: E402
+from pxr import Gf, Usd, UsdGeom, UsdPhysics  # noqa: E402
+
+
+def _find_articulation_root(stage, start_path: str, fallback: str) -> str:
+    """The robot payload root (e.g. /World/g1) is usually a plain Xform; the
+    PhysX articulation lives on a child prim. The ROS2 joint-state publisher and
+    the tensor articulation view need that exact root, else they spam
+    'did not match any articulations'. Walk the subtree for the ArticulationRoot
+    API and return its path (fallback to start_path if none found)."""
+    start = stage.GetPrimAtPath(start_path)
+    if start and start.IsValid():
+        for prim in Usd.PrimRange(start):
+            if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+                return str(prim.GetPath())
+    return fallback
+
+
+def _find_prim_by_name(stage, start_path: str, name: str, fallback: str) -> str:
+    """Find a prim by leaf name under start_path. The cloud G1 USD lays the link
+    prims out flat under the robot root (/World/g1/mid360_link), not nested like
+    the URDF (/World/g1/torso_link/mid360_link), so the default mount path misses
+    and the sensor would fall back to an empty Xform at the torso origin."""
+    start = stage.GetPrimAtPath(start_path)
+    if start and start.IsValid():
+        for prim in Usd.PrimRange(start):
+            if prim.GetName() == name:
+                return str(prim.GetPath())
+    return fallback
 
 # RTX lidar + ROS 2 bridge + physics IMU sensor.
 for _ext in ("isaacsim.sensors.rtx", "isaacsim.sensors.physics", "isaacsim.ros2.bridge"):
@@ -123,14 +162,26 @@ simulation_app.update()
 stage = ctx.get_stage()
 carb.log_warn(f"[g1_sim] opened stage: {args.usd}")
 
+# Resolve the real articulation root under the robot payload (used by the joint
+# -state publisher and the --stabilize tensor articulation view).
+robot_artic = _find_articulation_root(stage, args.robot_prim, args.robot_prim)
+carb.log_warn(f"[g1_sim] articulation root: {robot_artic} (robot_prim={args.robot_prim})")
+
 # ---------------------------------------------------------------------------
 # Make sure the mount prim exists (it lives inside the G1 payload; create an
 # Xform fallback so the script also works on stages without it).
 # ---------------------------------------------------------------------------
-mount_path = args.mount_path
+# Mount the lidar + IMU at the REAL mid360_link prim (head height, upright). The
+# cloud G1 USD has flat link prims, so the nested --mount-path default misses and
+# the sensor would otherwise fall back to an empty Xform at the torso origin
+# (chest) -- boxed in by the arms/head, where it mostly scans the robot itself.
+mount_path = _find_prim_by_name(stage, args.robot_prim, "mid360_link", args.mount_path)
 if not stage.GetPrimAtPath(mount_path).IsValid():
-    carb.log_warn(f"[g1_sim] mount {mount_path} missing -> creating Xform fallback")
+    carb.log_warn(f"[g1_sim] mount {mount_path} missing -> creating Xform fallback "
+                  f"(lidar may be mis-placed; check the G1 USD link layout)")
     UsdGeom.Xform.Define(stage, mount_path)
+else:
+    carb.log_warn(f"[g1_sim] lidar/IMU mount prim: {mount_path}")
 
 # Extra orientation at the mount (XYZW order from roll,pitch,yaw).
 _r, _p, _y = (float(v) for v in args.lidar_rpy_deg.split(","))
@@ -145,15 +196,19 @@ sensor_orient = Gf.Quatd(_q.GetReal(), _q.GetImaginary())
 # RTX LiDAR (Livox MID-360 approximation) -> PointCloud2.
 # ---------------------------------------------------------------------------
 lidar_path = mount_path + "/mid360_lidar"
-# Custom JSON profiles (not built-in USD assets in SUPPORTED_LIDAR_CONFIGS) take
-# the command's _call_replicator_api fallback, which forwards extra kwargs to
-# the prim at CREATION time -- so pass `sensorModelConfig` here, not after. A
-# post-creation Set() is too late: the omni.sensors plugin builds the sensor
-# model from sensorModelConfig when the prim is created, so a later value is
-# ignored and the lidar renders nothing (empty cloud, width:0). The
-# "Config '...' not found" warning that still prints is cosmetic (it's the
-# USD-asset-name lookup; the JSON profile loads via sensorModelConfig + the
-# search-folder symlink set up in launch_g1_sim.sh).
+# Create the MID-360 as a modern OmniLidar via the replicator path: pass the
+# custom JSON profile by NAME in `config`. The profile resolves from the
+# `app.sensors.nv.lidar.profileBaseFolder` search folders (registered above +
+# symlinked into Isaac's data/lidar_configs by launch_g1_sim.sh), and the lidar
+# core plugin builds the 64-emitter MID-360 scan model from it -- a probe of
+# this exact call rendered ~40k points/frame against test geometry.
+#
+# Do NOT pass `sensorModelConfig` as a kwarg (the OmniLidar schema has no such
+# attribute -> the command raises "No attribute 'sensorModelConfig'" and aborts)
+# and do NOT use force_camera_prim=True: the deprecated camera-prim path renders
+# almost nothing here (~379 pts vs 40k). The "Config '...' not found" warning
+# that still prints is cosmetic -- it is the USD-asset lookup in _add_reference,
+# which custom JSON profiles always miss before the replicator path builds them.
 _, lidar_prim = omni.kit.commands.execute(
     "IsaacSensorCreateRtxLidar",
     path=lidar_path,
@@ -161,15 +216,24 @@ _, lidar_prim = omni.kit.commands.execute(
     config=args.lidar_config,
     translation=(0.0, 0.0, 0.0),
     orientation=sensor_orient,
-    sensorModelConfig=args.lidar_config,
 )
-# Belt-and-suspenders: ensure the attribute is present/correct on the prim.
-_cfg_attr = lidar_prim.GetAttribute("sensorModelConfig")
-if not _cfg_attr or not _cfg_attr.IsValid():
-    _cfg_attr = lidar_prim.CreateAttribute("sensorModelConfig", Sdf.ValueTypeNames.String, False)
-_cfg_attr.Set(args.lidar_config)
-carb.log_warn(f"[g1_sim] sensorModelConfig = {_cfg_attr.Get()!r} "
-              f"(profile JSON from lidar config search folders)")
+if lidar_prim is None or not lidar_prim.IsValid():
+    carb.log_error(f"[g1_sim] failed to create MID-360 RTX lidar at {lidar_path}")
+    simulation_app.close()
+    sys.exit(1)
+carb.log_warn(f"[g1_sim] MID-360 OmniLidar created at {lidar_path} (config={args.lidar_config})")
+
+# IsaacSensorCreateRtxLidar sets skipDroppingInvalidPoints=True, which KEEPS
+# no-return rays in the published cloud (as non-finite / zero points). The real
+# MID-360 driver emits only valid returns; DLIO chokes on the invalid ones
+# (deskewed points: 0 -> 'free(): invalid next size' heap crash). Force it off so
+# the sim cloud contains only real hits, like the hardware.
+_skip = lidar_prim.GetAttribute("omni:sensor:Core:skipDroppingInvalidPoints")
+if _skip and _skip.IsValid():
+    _skip.Set(False)
+    carb.log_warn("[g1_sim] skipDroppingInvalidPoints=False (drop no-return rays for DLIO)")
+else:
+    carb.log_warn("[g1_sim] WARNING: skipDroppingInvalidPoints attr not found on lidar prim")
 
 lidar_render_product = rep.create.render_product(lidar_prim.GetPath(), [1, 1], name="mid360_rp")
 
@@ -208,13 +272,19 @@ og.Controller.edit(
             ("ReadIMU", "isaacsim.sensors.physics.IsaacReadIMU"),
             ("PublishIMU", "isaacsim.ros2.bridge.ROS2PublishImu"),
             ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
+            # Joint angles of the G1 articulation -> /joint_states, so the URDF
+            # robot_state_publisher (g1_bringup robot_model.launch.py) shows the
+            # actual sim pose in RViz instead of a neutral one.
+            ("PublishJoints", "isaacsim.ros2.bridge.ROS2PublishJointState"),
         ],
         og.Controller.Keys.CONNECT: [
             ("OnTick.outputs:tick", "ReadIMU.inputs:execIn"),
             ("OnTick.outputs:tick", "PublishClock.inputs:execIn"),
+            ("OnTick.outputs:tick", "PublishJoints.inputs:execIn"),
             ("ReadIMU.outputs:execOut", "PublishIMU.inputs:execIn"),
             ("ReadSimTime.outputs:simulationTime", "PublishIMU.inputs:timeStamp"),
             ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+            ("ReadSimTime.outputs:simulationTime", "PublishJoints.inputs:timeStamp"),
             ("ReadIMU.outputs:linAcc", "PublishIMU.inputs:linearAcceleration"),
             ("ReadIMU.outputs:angVel", "PublishIMU.inputs:angularVelocity"),
             ("ReadIMU.outputs:orientation", "PublishIMU.inputs:orientation"),
@@ -224,6 +294,7 @@ og.Controller.edit(
             ("PublishIMU.inputs:topicName", args.imu_topic),
             ("PublishIMU.inputs:frameId", args.frame_id),
             ("PublishClock.inputs:topicName", args.clock_topic),
+            ("PublishJoints.inputs:topicName", args.joint_states_topic),
         ],
     },
 )
@@ -233,12 +304,24 @@ set_targets(
     attribute="inputs:imuPrim",
     target_prim_paths=[imu_path],
 )
-carb.log_warn(f"[g1_sim] IMU @ {imu_path} -> {args.imu_topic} ({args.frame_id})")
+# targetPrim of the joint-state publisher = the G1 articulation root.
+set_targets(
+    prim=stage.GetPrimAtPath(GRAPH + "/PublishJoints"),
+    attribute="inputs:targetPrim",
+    target_prim_paths=[robot_artic],
+)
+carb.log_warn(f"[g1_sim] IMU @ {imu_path} -> {args.imu_topic} ({args.frame_id}); "
+              f"joint states -> {args.joint_states_topic} from {args.robot_prim}")
 
 # ---------------------------------------------------------------------------
 # Optional fixed base: pin the pelvis to the world so the unactuated robot does
 # not collapse during static localization tests.
 # ---------------------------------------------------------------------------
+if args.hold_pose and args.stabilize:
+    carb.log_error("[g1_sim] --hold-pose and --stabilize are mutually exclusive; "
+                   "ignoring --hold-pose (AMO actively stands the robot).")
+    args.hold_pose = False
+
 if args.hold_pose:
     if not stage.GetPrimAtPath(args.robot_root).IsValid():
         carb.log_error(f"[g1_sim] --hold-pose: root prim {args.robot_root} not found; "
@@ -255,17 +338,36 @@ if args.hold_pose:
 # ---------------------------------------------------------------------------
 # Run. Sim time drives /clock; use_sim_time:=true on the ROS side.
 # ---------------------------------------------------------------------------
-sim_ctx = SimulationContext(physics_dt=1.0 / 200.0, rendering_dt=1.0 / 60.0,
+_PHYSICS_DT = 1.0 / 200.0
+sim_ctx = SimulationContext(physics_dt=_PHYSICS_DT, rendering_dt=1.0 / 60.0,
                             stage_units_in_meters=1.0)
 simulation_app.update()
 sim_ctx.play()
+
+# --stabilize: actively hold the G1 upright with the Navigation AMO policy. Set
+# up AFTER play() so the articulation can initialize against a running timeline.
+stabilizer = None
+if args.stabilize:
+    sys.path.insert(0, _HERE)
+    from isaac_amo_stabilizer import Stabilizer  # noqa: E402
+    stabilizer = Stabilizer(robot_prim=robot_artic, physics_dt=_PHYSICS_DT,
+                            command=(0.0, 0.0, 0.0))
+    stabilizer.setup()
+    # Tick AMO on every physics step (200 Hz); it decimates to the policy's
+    # 50 Hz internally. A physics callback is correctly timed, unlike the
+    # render-rate app.update() loop below.
+    sim_ctx.add_physics_callback("amo_stabilize", lambda _dt: stabilizer.on_physics_step())
+    carb.log_warn("[g1_sim] --stabilize: AMO policy holding the G1 standing pose.")
+
 carb.log_warn("[g1_sim] playing. Publishing /livox/lidar, /livox/imu_raw, /clock. "
               "Run 'ros2 launch g1_sim_bridge sim_localization.launch.py' to get "
-              "/livox/lidar_reliable + /livox/imu for DLIO. Drive the G1 joints "
-              "with your locomotion policy/companion to walk.")
+              "/livox/lidar_reliable + /livox/imu for DLIO.")
 
-while simulation_app.is_running():
-    simulation_app.update()
-
-sim_ctx.stop()
-simulation_app.close()
+try:
+    while simulation_app.is_running():
+        simulation_app.update()
+finally:
+    if stabilizer is not None:
+        stabilizer.shutdown()
+    sim_ctx.stop()
+    simulation_app.close()

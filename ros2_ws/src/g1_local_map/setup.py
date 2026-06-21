@@ -2,7 +2,7 @@ import glob
 
 from setuptools import setup
 
-package_name = 'g1_sim_bridge'
+package_name = 'g1_local_map'
 
 setup(
     name=package_name,
@@ -18,17 +18,14 @@ setup(
     zip_safe=True,
     maintainer='Lorenzo Ortolani',
     maintainer_email='lorenzo.ortolani@talosrobotics.ai',
-    description='DLIO sensor bridges: Isaac Sim QoS relay (sim) + Livox IMU '
-                'g->m/s^2 rescale (real robot).',
+    description='Local rolling 3D voxel map (DLIO deskewed cloud -> ground-removed '
+                'obstacle cloud + voxel grid + costmap) for the a_star_mpc planner.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'isaac_dlio_qos_relay_node = '
-            'g1_sim_bridge.isaac_dlio_qos_relay_node:main',
-            'imu_rescale_node = g1_sim_bridge.imu_rescale_node:main',
-            'cmd_vel_to_amo_node = g1_sim_bridge.cmd_vel_to_amo_node:main',
-            'joy_to_cmdvel_node = g1_sim_bridge.joy_to_cmdvel_node:main',
+            'local_voxel_map_node = g1_local_map.local_voxel_map_node:main',
+            'ground_removal_node = g1_local_map.ground_removal_node:main',
         ],
     },
 )
