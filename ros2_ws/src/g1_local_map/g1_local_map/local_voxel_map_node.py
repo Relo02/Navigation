@@ -46,16 +46,24 @@ from g1_local_map.ground_segmentation import GroundParams, segment_ground
 
 
 def read_xyz(msg: PointCloud2) -> np.ndarray:
-    """Extract an (N, 3) float64 array of xyz from a PointCloud2 (NaNs dropped)."""
-    try:
-        xyz = pc2.read_points_numpy(msg, field_names=("x", "y", "z"), skip_nans=True)
-        return np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
-    except AttributeError:
-        # Older sensor_msgs_py: read_points returns a structured ndarray.
-        rec = np.asarray(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
-        if rec.dtype.names:
-            return np.column_stack([rec["x"], rec["y"], rec["z"]]).astype(np.float64)
-        return rec.astype(np.float64).reshape(-1, 3)
+    """Extract an (N, 3) float64 array of xyz from a PointCloud2 (NaNs dropped).
+
+    Uses read_points (structured array), NOT read_points_numpy: the latter
+    asserts EVERY field in the cloud shares one datatype — even when you only
+    request x/y/z — which fails on the DLIO deskewed cloud, whose x/y/z (float32)
+    sit alongside intensity/timestamp/ring fields of other datatypes
+    ("AssertionError: All fields need to have the same datatype"). read_points
+    handles mixed-datatype clouds and we pull only the xyz columns.
+    """
+    rec = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+    if not isinstance(rec, np.ndarray):
+        # Older sensor_msgs_py returns an iterable of (x, y, z) tuples.
+        rec = np.array(list(rec))
+    if rec.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    if rec.dtype.names:
+        return np.column_stack([rec["x"], rec["y"], rec["z"]]).astype(np.float64)
+    return rec.astype(np.float64).reshape(-1, 3)
 
 
 class VoxelAccumulator:
@@ -121,7 +129,7 @@ class LocalVoxelMapNode(Node):
         self.publish_costmap = bool(p("publish_costmap", True).value)
         self.costmap_unknown_as = int(p("costmap_unknown_as", -1).value)  # -1 unknown / 0 free
 
-        # ── gravity-aware SVD ground segmentation (see ground_segmentation.py) ──
+        # ── per-cell local-minimum ground segmentation (see ground_segmentation.py) ──
         self.ground_params = GroundParams(
             cell=float(p("ground_cell", 0.40).value),            # XY tile for the plane fit (m)
             min_pts=int(p("ground_min_pts", 12).value),          # min points to fit a cell plane
@@ -176,8 +184,8 @@ class LocalVoxelMapNode(Node):
         self.get_logger().info(
             f"local_voxel_map up | cloud={self.cloud_topic} odom={self.odom_topic} | "
             f"window=±{self.half_width:.1f}m voxel={self.voxel_size:.2f}m "
-            f"ground(cell={self.ground_params.cell:.2f}m slope_tol={self.ground_params.slope_tol_deg:.0f}deg "
-            f"step_tol={self.ground_params.step_tol:.2f}m) persistence={self.persistence_s:.1f}s"
+            f"ground(local-min cell={self.ground_params.cell:.2f}m band={self.ground_params.ground_band:.2f}m "
+            f"min_pts={self.ground_params.min_pts}) persistence={self.persistence_s:.1f}s"
         )
 
     def _on_odom(self, msg: Odometry) -> None:
@@ -233,6 +241,7 @@ class LocalVoxelMapNode(Node):
             self.get_logger().info(
                 f"in={xyz.shape[0]} cropped={cropped.shape[0]} "
                 f"accum_vox={raw_centers.shape[0]} obstacles={obstacles.shape[0]} "
+                f"cand={seg_info['candidate_cells']} seed={seg_info['seed_cells']} "
                 f"ground_cells={seg_info['ground_cells']} | "
                 f"robot=({cx:.2f},{cy:.2f},{cz:.2f}) zband=[{cz - self.z_below:.2f},{cz + self.z_above:.2f}]")
 

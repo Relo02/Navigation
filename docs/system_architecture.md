@@ -11,8 +11,10 @@ velocity → AMO gait → robot moves → new pose*. The navigation layer thinks
 **goals and paths**; the AMO policy thinks only in **velocity commands**
 `(vx, vy, yaw_rate)`. The MPC is the bridge between the two.
 
-See also: [dockerfiles.md](dockerfiles.md) (the three images) and
-[amo_inference_plan.md](amo_inference_plan.md) (the gait + smoothing internals).
+See also: [dockerfiles.md](dockerfiles.md) (the three images),
+[amo_inference_plan.md](amo_inference_plan.md) (the gait + smoothing internals),
+[A_STAR_MPC_PLANNER.md](A_STAR_MPC_PLANNER.md) (the goal→velocity planner), and
+[LOCAL_VOXEL_MAP.md](LOCAL_VOXEL_MAP.md) (the ground-removed obstacle source).
 
 ---
 
@@ -163,13 +165,25 @@ flowchart LR
 ## 5. Bring-up order
 
 1. **Robot + DDS** reachable on the chosen NIC (`UNITREE_NET_IFACE`).
-2. **localization** — LiDAR preprocessing + DLIO → pose/odometry stable. Keep the
-   robot **stationary for the first ~3 s** so DLIO can run its IMU + gravity
+2. **localization** — LiDAR preprocessing + DLIO + `g1_local_map` →
+   pose/odometry + ground-removed obstacle cloud:
+   `ros2 launch g1_bringup real_localization.launch.py`. Keep the robot
+   **stationary for the first ~3 s** so DLIO can run its IMU + gravity
    calibration before it starts moving.
-3. **planner** (A\* + MPC) — consumes pose + clouds + goal, emits `velocity_target`.
-4. **amo_policy** — `./docker/run_amo.sh` (or `docker compose run amo_policy …`).
-   Staged snap-free activation runs first; then it tracks `velocity_target`
-   (`command.source: websocket`) or a configured/zero command.
+3. **planner** (A\* + MPC) —
+   `ros2 launch a_star_mpc_planner planner.launch.py`. Consumes pose
+   (`/dlio/odom_node/odom`), obstacles (`/local_voxel_map/obstacles`) and the
+   goal (`/global_goal`); emits a `Twist` on `/mpc/cmd_vel` that the bundled
+   `cmd_vel_to_amo` bridge forwards to the AMO WS as `velocity_target`.
+   *(Steps 2–3 can be started together with `ros2_ws/src/autonomy.sh`.)*
+4. **amo_policy** — start the gait and choose how it is driven:
+   - **Autonomous:** `AUTONOMOUS=1 NET_IF=… ./docker/run_amo.sh` →
+     `command.source=websocket`, tracking the MPC's `velocity_target`.
+   - **Manual (no autonomy):** `JOYSTICK=1 …` → drive with the Unitree pad,
+     used for teleop / SLAM-mapping a space.
+   Staged snap-free activation runs first either way.
+5. **Set a goal** — RViz **2D Goal Pose** tool (publishes `/global_goal`), or
+   `ros2 topic pub --once /global_goal …`. The robot then walks the planned path.
 
-Start the AMO gait with [../docker/run_amo.sh](../docker/run_amo.sh) — e.g.
-`NET_IF=eth0 ./run_amo.sh --observe_only` for a dry run.
+Dry run first with `NET_IF=eth0 ./run_amo.sh --observe_only` (no motor commands).
+Full planner details + tuning: [A_STAR_MPC_PLANNER.md](A_STAR_MPC_PLANNER.md).

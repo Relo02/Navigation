@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
 """
-Gravity-aware ground segmentation by per-cell SVD/eigen plane fitting.
+Per-cell local-minimum ground segmentation (pure-numpy, no ROS deps).
 
-Pure-numpy (no ROS deps -> unit-testable) replacement for the old per-cell
-lowest-point heuristic in ``local_voxel_map_node.segment_obstacles``. Operates on
-the DLIO **accumulated odom-frame cloud** the local map already builds, using the
-**gravity vector** DLIO gives us for free (odom is gravity-aligned at init, so
-"up" = +Z = ``-g_hat``).
+Robust, voxelization-friendly ground remover for the DLIO **accumulated
+odom-frame voxel cloud** the local map builds. Replaces an earlier gravity-aware
+SVD/eigen per-cell plane-fit: that method's planarity/flatness ratios are
+inflated by the 0.10 m voxel quantization, so most flat-floor cells were rejected
+as "not planar" and the floor was kept as obstacles. The local-minimum rule needs
+no such ratios and is per-cell relative, so it tolerates the voxel grid, a
+tilted/offset floor and sensor-height uncertainty without tuning.
 
-Pipeline (see docs/GROUND_REMOVAL_PLAN.md §2.3):
+Pipeline:
 
-  1. Tile the cloud into XY cells of size ``cell``; drop cells with < ``min_pts``.
-  2. Fit a plane per cell from the 3x3 covariance eigendecomposition:
-     normal = smallest-eigenvalue eigenvector (oriented up); thickness =
-     sqrt(lambda0); planarity = sqrt(lambda0/lambda1).
-  3. A cell is a ground *candidate* if it is planar (thin) AND its normal is
-     within ``slope_tol_deg`` of "up" (admits ramps/slopes, rejects walls).
-  4. Region-grow the ground manifold from seed cells at the robot's foot height,
-     across 8-neighbours whose planes stay continuous (height jump < ``step_tol``)
-     -- so the surface may bend (ramp) but breaks at curbs/steps, and elevated
-     horizontal slabs (shelf tops) stay obstacles because they don't connect.
-  5. Label points: in a manifold cell, signed distance ``d`` to its plane decides
-     ground (|d|<=band, drop) vs obstacle (band<d<=max_height, keep); points in
-     non-manifold cells are kept (fail-open) up to ``max_height`` above the foot.
+  1. Tile the cloud into XY cells of size ``cell``. Each cell's local ground
+     height is the **minimum** point height (heights measured along gravity-up,
+     ``-g_hat``; that is +Z for DLIO odom). Cells with < ``min_pts`` points are
+     ignored when setting ground, so a lone stray-low point can't define it.
+  2. **Min-pool** the per-cell minima over a 3x3 neighbourhood, so a cell that
+     holds only a tall obstacle (and no floor return) is compared against the
+     surrounding floor instead of treating the obstacle as its own ground.
+  3. Label each point by how far it rises above its cell's local ground:
+     ``<= ground_band`` -> ground (drop); ``ground_band .. max_height`` ->
+     obstacle (keep); ``> max_height`` -> ceiling (drop).
 
-Fail-safe by construction: an empty/too-sparse cloud or a missing ground manifold
-never blanks the obstacle cloud -- it passes geometry through (capped at
-``max_height``). Better a cluttered costmap than a blind one.
+Fail-safe: an empty/too-sparse cloud passes through (capped at ``max_height``
+above the foot); cells whose 3x3 neighbourhood has no valid ground also fail
+open. Better a cluttered costmap than a blind one.
+
+Limitation vs a plane-fit method: a LARGE solid elevated slab that fully occludes
+the floor beneath it (e.g. a big tabletop the lidar can't see under) has interior
+cells with no lower neighbour within the 3x3 window, so its interior reads as
+local ground; its edges — and anything standing on it — still register as
+obstacles. For navigation this is an acceptable trade for robustness. Within-cell
+slope (ramps) is handled only up to ~``ground_band`` of rise across a cell;
+widen ``ground_band`` or shrink ``cell`` for steep ramps.
 """
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -39,16 +45,22 @@ import numpy as np
 
 @dataclass(frozen=True)
 class GroundParams:
-    """Tunables for :func:`segment_ground` (see docs/GROUND_REMOVAL_PLAN.md §3)."""
+    """Tunables for :func:`segment_ground`.
 
-    cell: float = 0.40            # XY tile size for the per-cell plane fit (m)
-    min_pts: int = 12             # min points to fit a cell plane
-    planarity_max: float = 0.10   # sqrt(lambda0/lambda1) upper bound for "planar"
-    flat_max: float = 0.05        # sqrt(lambda0) upper bound (m): absolute flatness
-    slope_tol_deg: float = 30.0   # max plane<->gravity angle counted as ground (deg)
-    step_tol: float = 0.08        # max height jump across a cell edge to keep growing (m)
-    ground_band: float = 0.06     # |dist to ground plane| <= this => ground (m)
-    seed_band: float = 0.15       # foot-height window for seed cells (m)
+    Used by the local-minimum filter: ``cell``, ``min_pts``, ``ground_band``,
+    ``leg_offset``, ``max_height``, ``min_total``. The remaining fields
+    (``planarity_max``, ``flat_max``, ``slope_tol_deg``, ``step_tol``,
+    ``seed_band``) are retained for config/back-compat and are ignored.
+    """
+
+    cell: float = 0.40            # XY tile size for the local-minimum (m)
+    min_pts: int = 12             # min points for a cell to define its ground
+    planarity_max: float = 0.10   # (unused) legacy SVD planarity bound
+    flat_max: float = 0.05        # (unused) legacy SVD absolute flatness (m)
+    slope_tol_deg: float = 30.0   # (unused) legacy SVD slope tolerance (deg)
+    step_tol: float = 0.08        # (unused) legacy SVD region-grow step (m)
+    ground_band: float = 0.06     # rise above local ground still counted as ground (m)
+    seed_band: float = 0.15       # (unused) legacy SVD seed window (m)
     leg_offset: float = 1.0       # robot_z (sensor, odom) -> foot height drop (m)
     max_height: float = 2.0       # ignore points this far above ground (m)
     min_total: int = 200          # below this many points, pass the cloud through
@@ -57,15 +69,15 @@ class GroundParams:
 def segment_ground(xyz: np.ndarray, g_hat, robot_z: float,
                    params: GroundParams = GroundParams(),
                    return_info: bool = False):
-    """Remove the (gravity-aware) ground from an accumulated odom-frame cloud.
+    """Remove the ground from an accumulated odom-frame cloud (local-minimum).
 
     Args:
         xyz: (N, 3) float array of points in the gravity-aligned **odom** frame.
-        g_hat: gravity unit vector in that frame (DLIO odom: ~(0, 0, -1) -> up=+Z).
-        robot_z: robot/sensor Z in odom (from /dlio odom) -- sets the foot height
-            (``robot_z - leg_offset``) used to seed the ground and cap fail-open cells.
+        g_hat: gravity unit vector (DLIO odom: ~(0, 0, -1) -> up = +Z).
+        robot_z: robot/sensor Z in odom; sets the foot height
+            (``robot_z - leg_offset``) used to cap fail-open points.
         params: :class:`GroundParams`.
-        return_info: also return a diagnostics dict (cell/seed/manifold counts).
+        return_info: also return a diagnostics dict (cell/ground counts).
 
     Returns:
         ``obstacle_xyz`` (M, 3), or ``(obstacle_xyz, info)`` if ``return_info``.
@@ -74,122 +86,72 @@ def segment_ground(xyz: np.ndarray, g_hat, robot_z: float,
     n_pts = xyz.shape[0]
     foot = float(robot_z) - params.leg_offset
 
-    # "up" = -gravity, normalised. Use it explicitly (not a hard-coded z index) so
-    # a future per-scan gravity from the live odom orientation drops straight in.
+    # "up" = -gravity, normalised. Heights are measured along it, so the filter
+    # is correct even if odom gravity isn't exactly +Z.
     up = -np.asarray(g_hat, dtype=np.float64).reshape(3)
     up_norm = np.linalg.norm(up)
     up = up / up_norm if up_norm > 1e-9 else np.array([0.0, 0.0, 1.0])
 
-    def _passthrough(status):
-        keep = (xyz[:, 2] - foot) <= params.max_height if n_pts else np.zeros(0, bool)
-        out = xyz[keep] if n_pts else xyz
-        if return_info:
-            return out, {"status": status, "n_pts": n_pts, "n_cells": 0,
-                         "candidate_cells": 0, "seed_cells": 0, "ground_cells": 0,
-                         "manifold_found": False}
-        return out
+    def _info(status, ground_cells, n_cells):
+        # candidate_cells / seed_cells kept for the node heartbeat's field names.
+        return {"status": status, "n_pts": n_pts, "n_cells": n_cells,
+                "candidate_cells": ground_cells, "seed_cells": ground_cells,
+                "ground_cells": ground_cells, "manifold_found": ground_cells > 0}
 
-    # Failsafe: too few points for a reliable per-cell fit -> pass through.
+    def _passthrough(status):
+        if n_pts == 0:
+            out = xyz.reshape(0, 3)
+        else:
+            above = (xyz @ up) - foot
+            out = xyz[above <= params.max_height]
+        return (out, _info(status, 0, 0)) if return_info else out
+
+    # Failsafe: too few points for reliable per-cell minima -> pass through.
     if n_pts < params.min_total:
         return _passthrough("sparse")
 
-    # 1. Tile into XY cells; build a compact per-cell id (inv) for vectorised stats.
+    h = xyz @ up
+    # Horizontal cell indices (x, y are horizontal in the gravity-aligned frame).
     gx = np.floor(xyz[:, 0] / params.cell).astype(np.int64)
     gy = np.floor(xyz[:, 1] / params.cell).astype(np.int64)
-    cell_ij, inv = np.unique(np.stack([gx, gy], axis=1), axis=0, return_inverse=True)
-    inv = inv.reshape(-1)
-    n_cells = cell_ij.shape[0]
-    counts = np.bincount(inv, minlength=n_cells)
+    gx0, gy0 = int(gx.min()), int(gy.min())
+    ix = (gx - gx0).astype(np.intp)
+    iy = (gy - gy0).astype(np.intp)
+    W = int(ix.max()) + 1
+    H = int(iy.max()) + 1
 
-    # 2. Per-cell mean + 3x3 covariance via binned moments (no Python loop / no SVD).
-    def _csum(w):
-        return np.bincount(inv, weights=w, minlength=n_cells)
+    # Per-cell minimum height + point count.
+    cell_min = np.full((W, H), np.inf, dtype=np.float64)
+    np.minimum.at(cell_min, (ix, iy), h)
+    cell_cnt = np.zeros((W, H), dtype=np.int64)
+    np.add.at(cell_cnt, (ix, iy), 1)
+    # A lone low point must not define ground: ignore under-populated cells.
+    cell_min[cell_cnt < params.min_pts] = np.inf
 
-    inv_c = 1.0 / np.maximum(counts, 1)
-    mean = np.stack([_csum(xyz[:, 0]), _csum(xyz[:, 1]), _csum(xyz[:, 2])], axis=1) * inv_c[:, None]
-    cov = np.empty((n_cells, 3, 3), dtype=np.float64)
-    cov[:, 0, 0] = _csum(xyz[:, 0] * xyz[:, 0]) * inv_c - mean[:, 0] * mean[:, 0]
-    cov[:, 1, 1] = _csum(xyz[:, 1] * xyz[:, 1]) * inv_c - mean[:, 1] * mean[:, 1]
-    cov[:, 2, 2] = _csum(xyz[:, 2] * xyz[:, 2]) * inv_c - mean[:, 2] * mean[:, 2]
-    cov[:, 0, 1] = cov[:, 1, 0] = _csum(xyz[:, 0] * xyz[:, 1]) * inv_c - mean[:, 0] * mean[:, 1]
-    cov[:, 0, 2] = cov[:, 2, 0] = _csum(xyz[:, 0] * xyz[:, 2]) * inv_c - mean[:, 0] * mean[:, 2]
-    cov[:, 1, 2] = cov[:, 2, 1] = _csum(xyz[:, 1] * xyz[:, 2]) * inv_c - mean[:, 1] * mean[:, 2]
+    # 3x3 neighbourhood min-pool (pure-numpy shift-and-min). Empty / under-
+    # populated cells are +inf, so they never lower a neighbour's ground.
+    pooled = cell_min.copy()
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            if di == 0 and dj == 0:
+                continue
+            shifted = np.full((W, H), np.inf, dtype=np.float64)
+            di0, di1 = max(0, -di), W - max(0, di)     # destination row span
+            si0, si1 = max(0, di), W - max(0, -di)      # source row span
+            dj0, dj1 = max(0, -dj), H - max(0, dj)
+            sj0, sj1 = max(0, dj), H - max(0, -dj)
+            shifted[di0:di1, dj0:dj1] = cell_min[si0:si1, sj0:sj1]
+            pooled = np.minimum(pooled, shifted)
 
-    # eigh: ascending eigenvalues; eigvecs[..., :, 0] is the smallest -> plane normal.
-    evals, evecs = np.linalg.eigh(cov)
-    evals = np.clip(evals, 0.0, None)
-    normal = evecs[:, :, 0].copy()
-    ndotup = normal @ up
-    flip = ndotup < 0.0          # orient every normal "up" (+ along -gravity)
-    normal[flip] *= -1.0
-    ndotup = np.abs(ndotup)
-
-    thickness = np.sqrt(evals[:, 0])                       # RMS plane thickness (m)
-    planarity = np.sqrt(evals[:, 0] / (evals[:, 1] + 1e-12))
-
-    # 3. Ground-candidate cells: enough points, thin/planar, near-gravity-aligned.
-    cos_tol = np.cos(np.deg2rad(params.slope_tol_deg))
-    candidate = (
-        (counts >= params.min_pts)
-        & (thickness < params.flat_max)
-        & (planarity < params.planarity_max)
-        & (ndotup > cos_tol)
-    )
-
-    # 4. Region-grow the ground manifold from foot-height seeds across continuous
-    #    candidate neighbours (height jump < step_tol). Lone slabs never connect.
-    seed_mask = candidate & (np.abs(mean[:, 2] - foot) < params.seed_band)
-    in_ground = np.zeros(n_cells, dtype=bool)
-
-    if seed_mask.any():
-        cellmap = {(int(cell_ij[k, 0]), int(cell_ij[k, 1])): k
-                   for k in np.where(candidate)[0]}
-        nz = np.where(np.abs(normal[:, 2]) > 1e-6, normal[:, 2], 1e-6)
-        dq = deque()
-        for s in np.where(seed_mask)[0]:
-            if not in_ground[s]:
-                in_ground[s] = True
-                dq.append(int(s))
-        neigh = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
-        while dq:
-            a = dq.popleft()
-            ai, aj = int(cell_ij[a, 0]), int(cell_ij[a, 1])
-            for di, dj in neigh:
-                b = cellmap.get((ai + di, aj + dj))
-                if b is None or in_ground[b]:
-                    continue
-                # Height of A's plane at B's centroid vs B's own centroid height.
-                dxy = mean[b, :2] - mean[a, :2]
-                z_a = mean[a, 2] - (normal[a, 0] * dxy[0] + normal[a, 1] * dxy[1]) / nz[a]
-                if abs(z_a - mean[b, 2]) < params.step_tol:
-                    in_ground[b] = True
-                    dq.append(b)
-
-    # 5. Label every point by its cell.
-    in_manifold = in_ground[inv]
-    if in_manifold.any():
-        # Signed distance to the owning cell's plane, along the up-oriented normal.
-        d = np.einsum("ij,ij->i", xyz - mean[inv], normal[inv])
-    else:
-        d = np.zeros(n_pts)
-
-    keep = np.empty(n_pts, dtype=bool)
-    # Manifold cells: obstacle iff band < d <= max_height (drop ground & sub-ground).
-    keep[in_manifold] = (d[in_manifold] > params.ground_band) & (d[in_manifold] <= params.max_height)
-    # Non-manifold cells: fail-open -> keep geometry, only cap height above the foot.
-    nm = ~in_manifold
-    keep[nm] = (xyz[nm, 2] - foot) <= params.max_height
+    ground = pooled[ix, iy]
+    valid = np.isfinite(ground)
+    # Valid cells: rise above local ground. Fail-open cells: rise above the foot.
+    above = np.where(valid, h - ground, h - foot)
+    keep = (above > params.ground_band) & (above <= params.max_height)
 
     obstacles = xyz[keep]
     if return_info:
-        info = {
-            "status": "ok" if in_ground.any() else "no_manifold",
-            "n_pts": n_pts,
-            "n_cells": n_cells,
-            "candidate_cells": int(candidate.sum()),
-            "seed_cells": int(seed_mask.sum()),
-            "ground_cells": int(in_ground.sum()),
-            "manifold_found": bool(in_ground.any()),
-        }
-        return obstacles, info
+        n_cells = int((cell_cnt > 0).sum())
+        ground_cells = int(np.isfinite(cell_min).sum())
+        return obstacles, _info("ok", ground_cells, n_cells)
     return obstacles

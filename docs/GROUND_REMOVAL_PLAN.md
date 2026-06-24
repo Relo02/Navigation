@@ -1,5 +1,12 @@
 # Ground removal redesign — gravity-aware, SVD plane segmentation
 
+> **SUPERSEDED (2026-06-24).** This SVD plane-fit method was implemented but its
+> planarity/flatness *ratios* proved fragile on the 0.10 m voxelized cloud (most
+> flat-floor cells rejected as "not planar" → floor kept as obstacles). It was
+> replaced by a **per-cell local-minimum filter** — see
+> [GROUND_SEGMENTATION.md](GROUND_SEGMENTATION.md) for the current method. This
+> document is kept for history/rationale only.
+
 Plan to replace the current ground-removal logic with a method that fits local
 planes by **SVD** and classifies them against the **DLIO-estimated gravity
 vector**, so the floor is removed correctly while the robot pitches/rolls during

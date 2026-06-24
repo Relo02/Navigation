@@ -1,0 +1,181 @@
+# G1 humanoid tuning for the A* + MPC local planner — Navigation / DLIO stack.
+#
+# Re-adapted from the G1_navigation planner config for this repo's perception
+# front-end: DLIO localization + g1_local_map. The key differences from the
+# original config, all driven by the new I/O, are called out inline:
+#   * pose      : DLIO odometry on /dlio/odom_node/odom (Odometry → PoseStamped)
+#   * obstacles : g1_local_map's ground-removed /local_voxel_map/obstacles
+#   * frame     : odom origin is at the SENSOR (~1 m above the floor), so the
+#                 floor sits near z ≈ -1 m. Absolute-z rules (step-over, voxel
+#                 z-band) are adjusted accordingly; the gmap cost layer is
+#                 per-cell relative and so is unaffected by the z offset.
+/**:
+  ros__parameters:
+    # ─── Topics (DLIO + g1_local_map) ───────────────────────────────
+    odom_topic: /dlio/odom_node/odom            # DLIO odometry (Odometry msg)
+    obstacle_topic: /local_voxel_map/obstacles  # ground-removed obstacle cloud
+
+    # ─── Goal handling ────────────────────────────────────────────
+    wait_for_goal: true
+    goal_x: 2.0
+    goal_y: 0.0
+    goal_z: 0.0
+
+    # ─── Generic 2D OccupancyGrid fusion ────────────────────────────
+    # Backend-agnostic static-map layer (e.g. a Nav2 map server). Off by default.
+    enable_slam_map: false
+    slam_map_topic: /map
+    slam_map_occupied_threshold: 50
+    slam_map_unknown_is_obstacle: false
+    slam_map_max_age_sec: 5.0
+
+    # ─── DLIO global 3D map fusion ──────────────────────────────────
+    # OFF by default: g1_local_map already gives a dense, ground-removed,
+    # robot-centred obstacle cloud, so no static global-map fusion is needed.
+    # Set enable_dlio_map:=true to also fuse DLIO's keyframe global map
+    # (/dlio/map_node/map) as static context for structure out of the live FOV.
+    # That map is NOT ground-removed, so the fusion path strips its floor with
+    # per-cell segmentation (ground_segment_height) and caps points above the
+    # sensor by dlio_map_z_above before adding them as obstacles.
+    enable_dlio_map: false
+    dlio_map_topic: /dlio/map_node/map
+    dlio_map_max_age_sec: 30.0     # keyframe-rate map → tolerate a longer gap
+    dlio_map_z_above: 1.0          # drop fused points > this above the sensor z
+
+    # ─── A* local map / planning ──────────────────────────────────
+    grid_reso: 0.05                # finer cells for humanoid manoeuvring
+    grid_half_width: 20.0           # 20 m x 20 m local workspace
+    grid_std: 0.1               # Gaussian inflation spread (see note below)
+    obstacle_threshold: 0.5
+    obstacle_cost_weight: 50.0
+    replan_rate_hz: 1.0        # reactive at slow walk speeds
+    goal_reached_radius: 0.25
+    duplicate_goal_xy_tolerance: 0.05
+    duplicate_goal_z_tolerance: 0.05
+    planning_height: 0.0
+
+    # ─── Ground / obstacle segmentation ────────────────────────────
+    # OFF: /local_voxel_map/obstacles is ALREADY ground-removed (gravity-aware
+    # SVD segmentation in g1_local_map). Re-segmenting per-cell here would treat
+    # a low obstacle's own lowest point as ground and drop it. With this off,
+    # every incoming point feeds the obstacle cost layer directly, and the
+    # persistent map is fed the raw cloud (see a_star_node._lidar_cb).
+    ground_segment_en: false
+    ground_segment_height: 0.3
+    ground_removal_en: false       # legacy cloud-level RANSAC ground strip — off
+
+    # ─── 2.5D height-map awareness ────────────────────────────────
+    # DISABLED (<= 0.0). hmap stores ABSOLUTE odom-z, and in the DLIO sensor-
+    # origin frame the floor is at z ≈ -1 m, so a fixed absolute step-over
+    # threshold cannot separate a steppable curb from a tall obstacle. Since the
+    # obstacle cloud is already ground-removed and curbs that g1_local_map keeps
+    # are genuine obstacles, treat every point as a full blocker (safe). Re-enable
+    # only if you reference step-over to the floor height in the odom frame.
+    step_over_height: 0.0
+    step_over_cost_scale: 0.25
+
+    # ─── 3D voxel layer extent (RViz / 3D queries) ────────────────
+    # Sensor-origin frame: floor ≈ -1 m, obstacles span roughly [-1.5, +1.5] m
+    # around the sensor (vs a floor-at-0 band on a pelvis-origin frame), so the
+    # z-band is widened so vmap captures the obstacle cloud. With DLIO-map fusion
+    # off this only gates the vmap visualization layer.
+    voxel_z_min: -2.0
+    voxel_z_max: 2.0
+
+    # Persistent-map obstacle band (used only when ground_segment_en=true; with
+    # segmentation off the raw cloud is accumulated directly).
+    persistent_z_min: 0.15
+    persistent_z_max: 2.0
+    persistent_obstacle_height: 0.30
+
+    # ─── MPC horizon ──────────────────────────────────────────────
+    mpc_N: 50                      # 50 * 0.1 s = 5 s horizon
+    mpc_dt: 0.10
+
+    # ─── Actuator lag ─────────────────────────────────────────────
+    mpc_tau_v: 0.15
+    mpc_tau_w: 0.12
+
+    # ─── Velocity envelope (G1 humanoid; tracked by the AMO gait) ──
+    # These go straight into the AMO RL gait via the velocity_target WS bridge,
+    # so they must respect what AMO can track stably (vx ~0.3-0.5 m/s; biped vy
+    # tiny; AMO saturates yaw at ±0.2 rad/s internally).
+    mpc_vx_max: 0.45
+    mpc_vy_max: 0.05
+    # Tuned to AMO's DEMONSTRATED yaw authority: it spins cleanly at a direct
+    # --yaw 0.4 but ignores ~0.11, so its turn threshold is ~0.2-0.4. 0.20 (prev)
+    # capped the command BELOW that threshold -> the MPC's gentle -0.11 produced
+    # zero turning and the robot just stood. 0.80 was too high (planned turns
+    # faster than AMO executes -> hunting/spin). 0.40 matches what AMO actually
+    # does, with the stable 1 Hz replan avoiding the earlier path-jitter hunting.
+    mpc_omega_max: 0.40
+    mpc_v_ref: 0.30
+
+    # ─── Tracking weights ─────────────────────────────────────────
+    mpc_Q_x: 150.0
+    mpc_Q_y: 150.0
+    mpc_Q_yaw: 3.0
+    mpc_Q_terminal: 180.0
+
+    # ─── Control effort ───────────────────────────────────────────
+    mpc_R_vx: 8.0
+    mpc_R_vy: 12.0                 # discourage lateral commands more for biped
+    # Lowered 9.0 -> 3.0: with high R_omega the MPC barely used its yaw authority
+    # (commanded only ~-0.11 when misaligned, below AMO's turn threshold, so the
+    # robot never turned). Lower effort penalty -> it commits real yaw to align.
+    mpc_R_omega: 3.0
+    mpc_R_jerk: 3.0
+
+    # ─── Obstacle barrier (per-step collision veto) ───────────────
+    mpc_W_obs_sigmoid: 12.0
+    mpc_obs_alpha: 12.0
+    mpc_obs_r: 0.55                # humanoid base half-width + margin
+    mpc_max_obs_constraints: 12
+    mpc_obs_check_radius: 3.0
+
+    # ─── IPOPT ────────────────────────────────────────────────────
+    mpc_max_iter: 100
+    mpc_warm_start: true
+
+    # ─── MPC node settings ────────────────────────────────────────
+    # Velocity-control loop rate: the MPC re-solves and republishes /mpc/cmd_vel
+    # at this rate, so it IS the command refresh the gait sees. Must be ~10 Hz —
+    # at 1 Hz the gait holds a stale velocity for a full second and can't track
+    # the turn-then-walk, so the robot barely moves.
+    mpc_rate_hz: 10.0
+    mpc_lookahead_dist: 0.60
+    max_lidar_range: 5.0
+    mpc_path_resample_ds: 0.10
+    mpc_path_smooth_window: 7
+    mpc_setpoint_alpha: 0.30
+    mpc_setpoint_max_step: 0.15
+    mpc_setpoint_reset_dist: 1.0
+
+    # ─── MPC obstacle z-band ──────────────────────────────────────
+    # DISABLED (z_min > z_max). The obstacle cloud is already ground-removed by
+    # g1_local_map, so no z-band filtering is needed before the MPC flattens it
+    # to 2D — filtering twice would only delete genuine obstacles.
+    obstacle_z_min: 1.0
+    obstacle_z_max: -1.0
+
+    # ─── Velocity estimation ──────────────────────────────────────
+    vel_filter_alpha: 0.30
+
+    # ─── LiDAR staleness ──────────────────────────────────────────
+    # /local_voxel_map/obstacles refreshes ~10 Hz on the real robot. 1.0 s
+    # tolerates transient gaps; tighten toward 0.3 s once timing is confirmed.
+    lidar_max_age_sec: 1.0
+
+    # ─── Dynamic obstacle prediction ──────────────────────────────
+    obs_predict_frac: 0.20
+
+    # ─── Adaptive velocity ────────────────────────────────────────
+    adaptive_vel_limits: true
+
+    # ─── Security protocol ────────────────────────────────────────
+    mpc_security_threshold: 0.25
+    mpc_security_escape_radius: 2.0
+
+    # ─── Persistent obstacle map ──────────────────────────────────
+    map_decay_sec:  10.0
+    map_max_cells:  8000

@@ -77,41 +77,35 @@ re-centring**; the robot-centred window is enforced purely by the prune step.
 > for the floor to be a reliable per-cell minimum. **This ordering is the fix for
 > the "empty map" bug — never segment a single scan.**
 
-### 3. Ground removal — gravity-aware SVD plane segmentation
+### 3. Ground removal — per-cell local-minimum filter
 Run on the **accumulated (dense)** voxel centres by
 `ground_segmentation.segment_ground` (a pure-numpy, ROS-free module; full design
-in [`docs/GROUND_REMOVAL_PLAN.md`](GROUND_REMOVAL_PLAN.md)). odom is
-gravity-aligned by DLIO at init, so "up" is **+Z** and gravity `g_hat ≈ (0,0,-1)`
-comes **for free** as a constant.
+in [`docs/GROUND_SEGMENTATION.md`](GROUND_SEGMENTATION.md)). Heights are measured
+along gravity-up (`−g_hat`, ≈ `+Z` for DLIO odom).
 
-1. **Tile** the cloud into XY cells of size `ground_cell` (default **0.40 m**);
-   drop cells with `< ground_min_pts` points.
-2. **Fit a plane per cell** from the 3×3 covariance eigendecomposition
-   (`np.linalg.eigh`, batched, no Python loop): the smallest-eigenvalue
-   eigenvector is the normal (oriented up); `thickness = √λ₀`,
-   `planarity = √(λ₀/λ₁)`.
-3. **Ground-candidate** cell ⇔ planar (`thickness < ground_flat_max`,
-   `planarity < ground_planarity_max`) **and** its normal is within
-   `ground_slope_tol_deg` of vertical — this admits ramps/slopes but rejects walls.
-4. **Region-grow** the ground *manifold* from seed cells at the robot's foot
-   height (`robot_z − ground_leg_offset ± ground_seed_band`) across 8-neighbour
-   candidate cells whose planes stay **continuous** (height jump `< ground_step_tol`).
-   The surface may bend (ramp) but breaks at curbs/steps, and **elevated flat
-   slabs** (shelf/table tops) stay obstacles because they don't connect.
-5. **Label** each point by its cell: in a manifold cell, signed distance `d` to
-   the cell plane decides ground (`|d| ≤ ground_band` → drop) vs obstacle
-   (`ground_band < d ≤ max_height` → keep); points in non-manifold cells are
-   **kept** (fail-open) up to `max_height` above the foot.
+1. **Tile** the cloud into XY cells of size `ground_cell` (default **0.40 m**).
+2. **Per-cell local ground = the minimum height** in the cell; cells with
+   `< ground_min_pts` points are ignored (a lone stray-low point can't define it).
+3. **3×3 min-pool** the per-cell minima, so a cell that holds *only* a tall
+   obstacle is compared against the surrounding floor (not treated as its own
+   ground).
+4. **Label** each point by its rise above the cell's pooled ground:
+   `≤ ground_band` → ground (drop); `ground_band … max_height` → obstacle (keep);
+   `> max_height` → ceiling (drop).
 
-This is **slope- and step-robust** and gravity-referenced rather than relying on
-a per-cell lowest point (which one stray low return could drag down). It also
-distinguishes a *connected* ground surface from elevated horizontal slabs, which
-the old lowest-point method could not.
+Per-cell-**relative**, so it tolerates a tilted/offset floor, sensor-height
+uncertainty and the 0.10 m voxel quantization **without tuning**. This replaced a
+gravity-aware SVD plane-fit (see [`GROUND_REMOVAL_PLAN.md`](GROUND_REMOVAL_PLAN.md))
+whose planarity/flatness *ratios* were inflated by voxelization, causing most
+flat-floor cells to be kept as obstacles. Trade-off: a large slab that fully
+occludes the floor under it has its interior read as ground (edges + anything on
+it still block) — details and tuning in
+[`GROUND_SEGMENTATION.md`](GROUND_SEGMENTATION.md) §4.
 
-**Fail-safe by construction:** an empty / `< ground_min_total` cloud, or a cloud
-with no ground manifold (e.g. robot on a table, bad init gravity) never blanks the
-obstacle cloud — geometry passes through (capped at `max_height`) and the node logs
-a throttled warning. Better a cluttered costmap than a blind one.
+**Fail-safe by construction:** an empty / `< ground_min_total` cloud passes
+through (capped at `max_height` above the foot), and cells whose 3×3 neighbourhood
+has no valid ground fail open (keep geometry). Better a cluttered costmap than a
+blind one.
 
 ### 4. Publish
 The surviving obstacle voxel centres are published as `~/obstacles` and

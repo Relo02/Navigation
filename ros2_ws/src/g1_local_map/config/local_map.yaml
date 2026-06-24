@@ -20,18 +20,27 @@
     voxel_size:    0.10   # 3D voxel edge (m) — also the costmap resolution
     persistence_s: 3.0    # voxel memory before temporal decay (s); densifies sparse MID-360
 
-    # ── ground removal (gravity-aware SVD plane segmentation, on accumulated cloud) ──
-    # See docs/GROUND_REMOVAL_PLAN.md. odom is gravity-aligned by DLIO at init, so
-    # "up" is +Z; cells fit a plane (eigen of the 3x3 covariance) and are kept as
-    # ground when planar AND within slope_tol of vertical AND connected (region
-    # grown from foot-height seeds) — so ramps are removed but curbs/steps survive.
-    ground_cell:          0.40   # XY tile size for the per-cell plane fit (m)
-    ground_min_pts:       12     # min points to fit a cell plane
-    ground_planarity_max: 0.10   # sqrt(lambda0/lambda1) upper bound for "planar"
-    ground_flat_max:      0.05   # sqrt(lambda0) upper bound (m) — absolute flatness
-    ground_slope_tol_deg: 30.0   # max plane<->gravity angle counted as ground (deg) — set to steepest ramp
-    ground_step_tol:      0.08   # max height jump across a cell edge to keep growing (m) — smallest curb to keep
-    ground_band:          0.06   # |signed dist to ground plane| <= this => ground (m)
+    # ── ground removal (per-cell LOCAL-MINIMUM filter, on accumulated cloud) ──
+    # See ground_segmentation.py. Each XY cell's local ground = the MINIMUM point
+    # height (min-pooled over 3x3 so a cell holding only a tall obstacle is
+    # compared against the surrounding floor). A point is ground if it rises
+    # <= ground_band above that local minimum, an obstacle if ground_band..
+    # max_height above it. Per-cell-relative -> robust to floor height, mild
+    # tilt and the 0.10 m voxel quantization (this replaced an SVD plane-fit whose
+    # planarity ratios were inflated by voxelization, keeping the whole floor).
+    # ACTIVE knobs: ground_cell, ground_min_pts, ground_band, ground_leg_offset,
+    # max_height, ground_min_total.
+    ground_cell:          0.40   # XY tile size for the local-minimum (m)
+    ground_min_pts:       4      # min points for a cell to define its ground; LOW so sparse far cells still
+                                 # define (and remove) their floor instead of failing open (floor kept)
+    ground_band:          0.14   # rise above local ground still counted as ground (m); >= voxel_size,
+                                 # < smallest obstacle to keep. Widened to mop up mild floor unevenness/slope
+    # The following are LEGACY SVD params — IGNORED by the local-minimum filter,
+    # kept only so existing param files load cleanly. Safe to delete.
+    ground_planarity_max: 0.85   # (unused)
+    ground_flat_max:      0.15   # (unused)
+    ground_slope_tol_deg: 30.0   # (unused)
+    ground_step_tol:      0.10   # (unused)
     ground_seed_band:     0.15   # foot-height window for seed cells (m)
     ground_leg_offset:    1.0    # robot_z (sensor, odom) -> foot height drop (m); depends on sensor mount height
     ground_min_total:     200    # below this many accumulated points, pass the cloud through

@@ -139,7 +139,16 @@ def start_websocket_source(source: CommandSource, port: int) -> None:
         asyncio.set_event_loop(loop)
 
         async def _serve():
-            async with websockets.serve(_handler, "0.0.0.0", port):
+            # ping_interval=None disables server keepalive pings. The command
+            # channel is one-directional (the planner's cmd_vel_to_amo bridge is
+            # a minimal send-only client that never reads frames, so it cannot
+            # answer pings); with keepalive on, the server drops the connection
+            # every ~20 s with "1011 keepalive ping timeout" and the bridge has
+            # to reconnect. On localhost a dead peer is detected on the next send
+            # anyway, so keepalive buys nothing here.
+            async with websockets.serve(
+                _handler, "0.0.0.0", port, ping_interval=None
+            ):
                 logger.info("WS command server listening on :%d", port)
                 await asyncio.Future()
 
