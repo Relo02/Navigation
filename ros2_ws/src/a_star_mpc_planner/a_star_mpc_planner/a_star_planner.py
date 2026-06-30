@@ -23,7 +23,6 @@ author: Lorenzo Ortolani
 
 import math
 import heapq
-import numpy as np
 
 from a_star_mpc_planner.gaussian_grid_map import FixedGaussianGridMap
 
@@ -151,6 +150,14 @@ class AStarPlanner:
         path_grid = self._a_star(grid_map, six, siy, gix, giy)
         if path_grid is None:
             return None
+
+        # --- line-of-sight shortcutting (issue #4: A* staircase smoothness) ---
+        # 8-connected A* produces a 45° staircase; downstream CubicSpline
+        # smoothing then has to wiggle through every step. Collapsing collinear
+        # / line-of-sight-visible vertices first yields long straight segments
+        # the spline turns into a genuinely smooth, low-curvature path that the
+        # MPC tracks without fighting staircase jitter.
+        path_grid = self._shortcut_path(grid_map, path_grid)
 
         # Convert grid path to world coordinates
         return [grid_map.index_to_world(ix, iy) for ix, iy in path_grid]
@@ -355,6 +362,54 @@ class AStarPlanner:
         Minimum cell_cost = 1.0, so h = reso * euclidean_cell_distance never overestimates.
         """
         return math.hypot(gix - ix, giy - iy) * reso
+
+    def _shortcut_path(self, grid_map: FixedGaussianGridMap, path_grid: list) -> list:
+        """Greedy line-of-sight string-pulling on the grid path.
+
+        Walk from the current anchor as far along the path as a straight,
+        collision-free line of sight reaches, then drop every intermediate
+        vertex. Turns the 8-connected staircase into a handful of long straight
+        segments while never cutting through a non-free cell.
+        """
+        if path_grid is None or len(path_grid) <= 2:
+            return path_grid
+        out = [path_grid[0]]
+        anchor = 0
+        i = 1
+        n = len(path_grid)
+        while i < n - 1:
+            # Extend the segment [anchor -> i+1] while it stays in line of sight.
+            if self._line_of_sight(grid_map, path_grid[anchor], path_grid[i + 1]):
+                i += 1
+                continue
+            out.append(path_grid[i])
+            anchor = i
+            i += 1
+        out.append(path_grid[-1])
+        return out
+
+    def _line_of_sight(self, grid_map: FixedGaussianGridMap, a, b) -> bool:
+        """True if the Bresenham line from cell a to cell b is all free."""
+        x0, y0 = a
+        x1, y1 = b
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        x, y = x0, y0
+        while True:
+            if not self._is_free(grid_map, x, y):
+                return False
+            if x == x1 and y == y1:
+                return True
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
 
     @staticmethod
     def _extract_path(goal_node: _Node):

@@ -46,6 +46,24 @@ set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 PLANNER_DELAY="${PLANNER_DELAY:-3}"
 
+# ── Separate logs for localization vs planner ────────────────────────────────
+# Both launches used to share this terminal, so DLIO/g1_local_map and the
+# A*+MPC planner logs interleaved. Now each launch's stdout+stderr goes to its
+# OWN file so you can read them independently:
+#     tail -f logs/localization_latest.log     # DLIO + g1_local_map
+#     tail -f logs/planner_latest.log          # A* node + MPC node (+ bridge)
+# Override the directory with LOG_DIR=/path ./autonomy.sh. Set LOG_TO_CONSOLE=1
+# to ALSO mirror both streams to this terminal (they will interleave again).
+LOG_DIR="${LOG_DIR:-${WS}/logs}"
+mkdir -p "${LOG_DIR}"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOCALIZATION_LOG="${LOG_DIR}/localization_${TS}.log"
+PLANNER_LOG="${LOG_DIR}/planner_${TS}.log"
+# Stable "latest" symlinks so you can tail without knowing the timestamp.
+ln -sfn "$(basename "${LOCALIZATION_LOG}")" "${LOG_DIR}/localization_latest.log"
+ln -sfn "$(basename "${PLANNER_LOG}")"      "${LOG_DIR}/planner_latest.log"
+LOG_TO_CONSOLE="${LOG_TO_CONSOLE:-0}"
+
 pids=()
 cleanup() {
     trap - INT TERM EXIT
@@ -58,9 +76,22 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# Launch a `ros2 launch`, sending its output to a dedicated logfile (and, when
+# LOG_TO_CONSOLE=1, also to this terminal via tee). Records the launch PID — NOT
+# tee's — so cleanup signals the launch directly.
+run_launch() {
+    local logfile="$1"; shift
+    if [[ "${LOG_TO_CONSOLE}" == "1" ]]; then
+        "$@" > >(tee -a "${logfile}") 2>&1 &
+    else
+        "$@" > "${logfile}" 2>&1 &
+    fi
+    pids+=($!)
+}
+
 echo ">> [1/2] localization (DLIO + g1_local_map) on ROS_DOMAIN_ID=${ROS_DOMAIN_ID} ..."
-ros2 launch g1_bringup real_localization.launch.py &
-pids+=($!)
+echo ">>       logs -> ${LOCALIZATION_LOG}"
+run_launch "${LOCALIZATION_LOG}" ros2 launch g1_bringup real_localization.launch.py
 
 if (( PLANNER_DELAY > 0 )); then
     echo ">> waiting ${PLANNER_DELAY}s for DLIO IMU/gravity init — keep the robot STILL ..."
@@ -68,13 +99,34 @@ if (( PLANNER_DELAY > 0 )); then
 fi
 
 echo ">> [2/2] A*+MPC planner (+ cmd_vel -> AMO WS bridge) ..."
-ros2 launch a_star_mpc_planner planner.launch.py &
-pids+=($!)
+echo ">>       logs -> ${PLANNER_LOG}"
+run_launch "${PLANNER_LOG}" ros2 launch a_star_mpc_planner planner.launch.py
 
-echo ">> both launches running. Start the gait:  AUTONOMOUS=1 NET_IF=<nic> ./docker/run_amo.sh"
-echo ">> then set a goal in RViz (2D Goal Pose -> /global_goal). Ctrl-C stops both."
+echo ""
+echo ">> both launches running. Read their logs SEPARATELY (each in its own terminal):"
+echo ">>     tail -f ${LOG_DIR}/localization_latest.log"
+echo ">>     tail -f ${LOG_DIR}/planner_latest.log"
+echo ">> Start the gait:  AUTONOMOUS=1 NET_IF=<nic> ./docker/run_amo.sh"
+echo ">> then set a goal in RViz (2D Goal Pose -> /global_goal)."
 
-# Exit (and clean up) as soon as EITHER launch dies, so a crash never leaves the
-# other half running silently.
-wait -n 2>/dev/null || wait
+# ── Foreground keyboard e-stop ───────────────────────────────────────────────
+# This owns the terminal's stdin (the two launches stream to logfiles), so you
+# can SAFELY stop and later re-enable navigation without killing anything:
+#     s + Enter  ->  STOP  (zero velocity to the AMO gait; robot holds)
+#     g + Enter  ->  GO    (resume navigation)
+#     q + Enter  ->  quit autonomy.sh (stops everything)
+# DISABLE_ESTOP_KEYS=1 falls back to the old "Ctrl-C only / wait" behaviour.
+#
+# If a launch itself crashes, the velocity command to the gait still goes to
+# ZERO automatically — the MPC fail-safe (stale pose/path) and the bridge
+# cmd_vel watchdog both zero it — so a crash stops the robot even before you
+# press q / Ctrl-C here.
+echo ""
+if [[ "${DISABLE_ESTOP_KEYS:-0}" == "1" ]]; then
+    echo ">> e-stop keys disabled — Ctrl-C stops everything."
+    wait -n 2>/dev/null || wait
+else
+    echo ">> SAFETY E-STOP active in THIS terminal:  s=stop  g=go  q=quit"
+    ros2 run g1_sim_bridge estop_keyboard_node
+fi
 cleanup

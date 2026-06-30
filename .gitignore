@@ -10,3 +10,6 @@ ros2_ws/src/direct_lidar_inertial_odometry/doc/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Runtime logs from autonomy.sh (per-launch separated logs)
+ros2_ws/logs/

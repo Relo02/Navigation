@@ -43,23 +43,33 @@
     dlio_map_z_above: 1.0          # drop fused points > this above the sensor z
 
     # ─── A* local map / planning ──────────────────────────────────
-    grid_reso: 0.05                # finer cells for humanoid manoeuvring
-    grid_half_width: 20.0           # 20 m x 20 m local workspace
-    grid_std: 0.1               # Gaussian inflation spread (see note below)
+    # Grid SHRUNK for real-time (issue #3): the old 20 m half-width @ 0.05 m =
+    # 800x800 cells made A* (pure-Python) and the per-cycle costmap/voxel
+    # allocation the dominant cost. A local planner only needs a few metres of
+    # horizon; 6 m @ 0.10 m = 120x120 cells (~44x fewer) replans far faster, and
+    # the rolling-horizon goal projection still drives toward goals beyond it.
+    grid_reso: 0.10
+    grid_half_width: 6.0            # 12 m x 12 m local workspace
+    grid_std: 0.5                  # legacy (unused by the inflation costmap)
+    # Robot-radius inflation (issue #2). The OLD Gaussian-CDF cost peaked at 0.5
+    # exactly on an obstacle, so with obstacle_threshold 0.5 the planner kept
+    # ZERO clearance and clipped corners. Now: lethal core = robot_radius (hard
+    # block → guaranteed clearance), then a soft penalty band out to
+    # inflation_radius that keeps paths off walls.
+    robot_radius: 0.35             # G1 base half-width + small margin
+    inflation_radius: 0.70
+    publish_voxel_grid: false      # 3D voxel layer OFF (big per-cycle alloc)
     obstacle_threshold: 0.5
     obstacle_cost_weight: 50.0
-    replan_rate_hz: 1.0        # reactive at slow walk speeds
+    replan_rate_hz: 3.0            # faster replans → reactive to moving obstacles
     goal_reached_radius: 0.25
+    goal_heading_tolerance: 0.25    # MPC final heading tolerance (~14 deg)
     duplicate_goal_xy_tolerance: 0.05
+    duplicate_goal_yaw_tolerance: 0.10
     duplicate_goal_z_tolerance: 0.05
     planning_height: 0.0
 
     # ─── Ground / obstacle segmentation ────────────────────────────
-    # OFF: /local_voxel_map/obstacles is ALREADY ground-removed (gravity-aware
-    # SVD segmentation in g1_local_map). Re-segmenting per-cell here would treat
-    # a low obstacle's own lowest point as ground and drop it. With this off,
-    # every incoming point feeds the obstacle cost layer directly, and the
-    # persistent map is fed the raw cloud (see a_star_node._lidar_cb).
     ground_segment_en: false
     ground_segment_height: 0.3
     ground_removal_en: false       # legacy cloud-level RANSAC ground strip — off
@@ -101,7 +111,7 @@
     # so they must respect what AMO can track stably (vx ~0.3-0.5 m/s; biped vy
     # tiny; AMO saturates yaw at ±0.2 rad/s internally).
     mpc_vx_max: 0.45
-    mpc_vy_max: 0.05
+    mpc_vy_max: 0.45
     # Tuned to AMO's DEMONSTRATED yaw authority: it spins cleanly at a direct
     # --yaw 0.4 but ignores ~0.11, so its turn threshold is ~0.2-0.4. 0.20 (prev)
     # capped the command BELOW that threshold -> the MPC's gentle -0.11 produced
@@ -112,22 +122,26 @@
     mpc_v_ref: 0.30
 
     # ─── Tracking weights ─────────────────────────────────────────
-    mpc_Q_x: 150.0
-    mpc_Q_y: 150.0
-    mpc_Q_yaw: 3.0
+    mpc_Q_x: 300.0 # before: 150.0
+    mpc_Q_y: 300.0 # before: 150.0
+    mpc_Q_yaw: 300.0 # before 5.0
     mpc_Q_terminal: 180.0
 
     # ─── Control effort ───────────────────────────────────────────
-    mpc_R_vx: 8.0
+    mpc_R_vx: 20.0 # before: 8.0
     mpc_R_vy: 12.0                 # discourage lateral commands more for biped
     # Lowered 9.0 -> 3.0: with high R_omega the MPC barely used its yaw authority
     # (commanded only ~-0.11 when misaligned, below AMO's turn threshold, so the
     # robot never turned). Lower effort penalty -> it commits real yaw to align.
-    mpc_R_omega: 3.0
+    mpc_R_omega: 20.0
     mpc_R_jerk: 3.0
 
     # ─── Obstacle barrier (per-step collision veto) ───────────────
-    mpc_W_obs_sigmoid: 12.0
+    # Raised from 12 → 80 (issue #2): at 12 the barrier was far too weak to bend
+    # the trajectory around obstacles, so the MPC tracked the A* path almost
+    # regardless of what was in front of it. 80 gives firm avoidance while
+    # staying well below the level that destabilises IPOPT.
+    mpc_W_obs_sigmoid: 80.0
     mpc_obs_alpha: 12.0
     mpc_obs_r: 0.55                # humanoid base half-width + margin
     mpc_max_obs_constraints: 12
@@ -144,7 +158,9 @@
     # the turn-then-walk, so the robot barely moves.
     mpc_rate_hz: 10.0
     mpc_lookahead_dist: 0.60
-    max_lidar_range: 5.0
+    # Clamp obstacle consideration to the local horizon (matches grid_half_width
+    # 6 m; was 20 m, which kept far-field points the local planner never uses).
+    max_lidar_range: 8.0
     mpc_path_resample_ds: 0.10
     mpc_path_smooth_window: 7
     mpc_setpoint_alpha: 0.30
@@ -166,15 +182,43 @@
     # tolerates transient gaps; tighten toward 0.3 s once timing is confirmed.
     lidar_max_age_sec: 1.0
 
-    # ─── Dynamic obstacle prediction ──────────────────────────────
+    # ─── Dynamic obstacle clustering / prediction ─────────────────
+    # Predict only how far ahead in the horizon to extrapolate moving obstacles.
     obs_predict_frac: 0.20
+    # Cluster the obstacle cloud (grid connected-components) and track CLUSTER
+    # centroids, not individual voxel points — the old code shifted the whole
+    # cloud by per-point jitter, giving static walls phantom velocities.
+    obs_cluster_cell: 0.30         # grid cell for connected-component clustering
+    obs_static_speed: 0.15         # below this a cluster is static (not predicted)
+    obs_max_track_speed: 2.5       # reject implausible centroid matches above this
+    # RViz dynamic-obstacle velocity arrows (/mpc/obstacle_velocities): arrow
+    # length = speed * this many seconds (1 m/s → 1 m arrow at 1.0).
+    mpc_vel_arrow_scale: 1.0
 
     # ─── Adaptive velocity ────────────────────────────────────────
     adaptive_vel_limits: true
 
-    # ─── Security protocol ────────────────────────────────────────
-    mpc_security_threshold: 0.25
-    mpc_security_escape_radius: 2.0
+    # ─── Security protocol (grid-free, debounced — issue #1) ──────
+    # Engages only when a REAL obstacle point is within mpc_security_radius for
+    # mpc_security_engage_cycles consecutive solves, and clears after
+    # mpc_security_clear_cycles clean ones. This replaces the old inflated-grid
+    # check whose single-point false triggers caused the stop/go freeze. NOTE:
+    # g1_local_map drops self-hits within 0.4 m, so the trigger radius sits just
+    # outside that so it only fires on a genuinely imminent collision.
+    mpc_security_enable: true
+    mpc_security_radius: 0.45
+    mpc_security_escape_radius: 1.0
+    mpc_security_engage_cycles: 3
+    mpc_security_clear_cycles: 5
+
+    # ─── Fail-safe watchdog (issue #5) ────────────────────────────
+    # The MPC commands ZERO velocity (not a silent hold) when pose or path goes
+    # stale; the AMO bridge has its own cmd_vel timeout on top of this.
+    odom_timeout_sec: 0.5
+    path_timeout_sec: 2.0
+    goal_heading_kp: 1.0
+    goal_heading_min_omega: 0.20    # AMO ignores very small yaw commands
+    goal_heading_max_omega: 0.40
 
     # ─── Persistent obstacle map ──────────────────────────────────
     map_decay_sec:  10.0

@@ -81,6 +81,8 @@ def generate_launch_description():
             'max_forward_vel': 0.5,
             'max_lateral_vel': 0.1,
             'max_yaw_rate': 0.8,
+            # Fail-safe: zero the gait command if the MPC stops publishing.
+            'cmd_timeout_sec': 0.5,
             'use_sim_time': use_sim_time,
         }],
     )

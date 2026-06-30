@@ -1,22 +1,29 @@
 """
-Fixed-area 2.5D Gaussian grid map for local obstacle mapping.
+Fixed-area 2.5D inflated costmap for local obstacle mapping.
 
 Key design:
   - Fixed spatial extent (2*half_width x 2*half_width metres) that translates
     rigidly with the robot centre of mass — no growing or shrinking.
   - LiDAR points outside the window are silently ignored.
-  - Two parallel layers per cell:
-      gmap  — occupancy probability via a Gaussian CDF of XY-distance to the
-              nearest obstacle (the original Go2 behaviour).
-      hmap  — 2.5D extension: maximum z-height of any hit projected into the
-              cell. Used by a_star_planner.py to give cells below the
-              step-over threshold a reduced cost (G1 can clear ~8 cm).
-              Cells with no hit are NaN.
+  - Up to three parallel layers per cell (the last two are optional and OFF by
+    default — they were the dominant per-cycle cost):
+      gmap  — obstacle cost in [0, 1] built from a robot-radius INFLATION of the
+              nearest obstacle (Nav2-style lethal core + decaying soft band).
+              The old formulation was a Gaussian CDF of distance, whose value
+              peaks at exactly 0.5 *at* an obstacle — so with obstacle_threshold
+              0.5 only the exact occupied cell was ever blocked and the robot got
+              ZERO clearance. The inflation model below blocks a full robot_radius
+              around every obstacle and adds a soft gradient out to
+              inflation_radius so paths stop hugging walls (issue #2).
+      hmap  — 2.5D max-z of hits per cell (only built when build_hmap=True; used
+              by the A* step-over rule). NaN where no hit.
+      vmap  — 3D binary voxel occupancy (only built when build_vmap=True; for
+              RViz / 3D queries). Allocating this every cycle on a large grid is
+              expensive (cells*cells*cells_z float32), so it is OFF by default.
 """
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt, minimum_filter
-from scipy.stats import norm
 
 
 class FixedGaussianGridMap:
@@ -39,12 +46,30 @@ class FixedGaussianGridMap:
         z_max: float = 2.5,
         ground_segment_height: float = 0.20,
         ground_segment_en: bool = True,
+        robot_radius: float = 0.30,
+        inflation_radius: float = 0.60,
+        soft_cost_max: float = 0.49,
+        build_hmap: bool = True,
+        build_vmap: bool = True,
     ):
         self.reso = float(reso)
         self.half_width = float(half_width)
-        self.std = float(std)
+        self.std = float(std)   # retained for API compat; no longer used for gmap
         self.z_min = float(z_min)
         self.z_max = float(z_max)
+        # ── Robot-radius inflation (replaces the Gaussian-CDF cost) ──────────
+        # lethal core: cells within robot_radius of any obstacle are hard-blocked
+        #   (gmap = 1.0). With obstacle_threshold 0.5 this guarantees a full
+        #   robot_radius of clearance — the humanoid no longer clips corners.
+        # soft band: robot_radius < d <= inflation_radius decays from soft_cost_max
+        #   (just under threshold, so it is traversable but strongly discouraged)
+        #   to 0, giving A* a gradient that keeps the path off walls.
+        self.robot_radius = float(robot_radius)
+        self.inflation_radius = max(float(inflation_radius), float(robot_radius))
+        self.soft_cost_max = float(np.clip(soft_cost_max, 0.0, 0.499))
+        # Optional layers — OFF-capable to avoid the large per-cycle allocation.
+        self.build_hmap = bool(build_hmap)
+        self.build_vmap = bool(build_vmap)
         # Ground/obstacle segmentation: within each XY cell the lowest point is
         # taken as the local ground; points that rise more than
         # ground_segment_height above it are obstacles. The obstacle costmap is
@@ -140,12 +165,18 @@ class FixedGaussianGridMap:
         self.xw = self.cells
         self.yw = self.cells
 
-        # Start with an empty (zero-probability) map, NaN height layer,
-        # and empty 3D voxel grid.
+        # Start with an empty (zero-cost) map. The 2.5D height layer and the 3D
+        # voxel layer are OPTIONAL — only allocated when explicitly enabled, as
+        # the voxel grid in particular (cells*cells*cells_z float32) was the
+        # single biggest per-cycle allocation in the stack.
         self.gmap = np.zeros((self.cells, self.cells), dtype=np.float32)
-        self.hmap = np.full((self.cells, self.cells), np.nan, dtype=np.float32)
-        self.vmap = np.zeros(
-            (self.cells, self.cells, self.cells_z), dtype=np.float32
+        self.hmap = (
+            np.full((self.cells, self.cells), np.nan, dtype=np.float32)
+            if self.build_hmap else None
+        )
+        self.vmap = (
+            np.zeros((self.cells, self.cells, self.cells_z), dtype=np.float32)
+            if self.build_vmap else None
         )
 
         maxx = self.minx + 2.0 * self.half_width
@@ -169,20 +200,23 @@ class FixedGaussianGridMap:
             oz = oz[mask]
 
             if len(ox) > 0:
-                # ── 2.5D layer: max-z per cell ──
                 ix_pts = ((ox - self.minx) / self.reso).astype(np.intp)
                 iy_pts = ((oy - self.miny) / self.reso).astype(np.intp)
                 ix_pts = np.clip(ix_pts, 0, self.cells - 1)
                 iy_pts = np.clip(iy_pts, 0, self.cells - 1)
-                seed = np.full((self.cells, self.cells), -np.inf, dtype=np.float32)
-                np.maximum.at(seed, (ix_pts, iy_pts), oz.astype(np.float32))
-                touched = np.isfinite(seed)
-                self.hmap[touched] = seed[touched]
 
-                # ── 3D layer: binary occupancy per voxel ──
-                iz_pts = ((oz - self.z_min) / self.reso).astype(np.intp)
-                iz_pts = np.clip(iz_pts, 0, self.cells_z - 1)
-                self.vmap[ix_pts, iy_pts, iz_pts] = 1.0
+                # ── 2.5D layer: max-z per cell (only when enabled) ──
+                if self.hmap is not None:
+                    seed = np.full((self.cells, self.cells), -np.inf, dtype=np.float32)
+                    np.maximum.at(seed, (ix_pts, iy_pts), oz.astype(np.float32))
+                    touched = np.isfinite(seed)
+                    self.hmap[touched] = seed[touched]
+
+                # ── 3D layer: binary occupancy per voxel (only when enabled) ──
+                if self.vmap is not None:
+                    iz_pts = ((oz - self.z_min) / self.reso).astype(np.intp)
+                    iz_pts = np.clip(iz_pts, 0, self.cells_z - 1)
+                    self.vmap[ix_pts, iy_pts, iz_pts] = 1.0
 
                 # ── Ground/obstacle segmentation ──
                 # Local ground per cell = lowest point in that cell. A point is
@@ -222,15 +256,10 @@ class FixedGaussianGridMap:
         if len(obs_x) == 0:
             return False  # only ground in view → obstacle-free cost layer
 
-        # ── XY occupancy: Gaussian CDF of distance to the nearest obstacle ──
+        # ── XY cost: robot-radius inflation of the nearest obstacle ──
         # Rasterise obstacles into the grid and use a Euclidean distance
-        # transform instead of the old dense (cells, cells, N_obstacles) min
-        # broadcast. That broadcast was O(cells² · N) in MEMORY — with a dense
-        # cloud (e.g. N≈95 k on an 800×800 grid) it tried to allocate
-        # ~450 GiB and crashed the node. distance_transform_edt is O(cells²),
-        # INDEPENDENT of the obstacle count, and dedupes points to cells for
-        # free. The result matches the old min-distance to within one cell
-        # (≈reso·√2), negligible against the inflation std.
+        # transform (O(cells²), independent of obstacle count). EDT gives, for
+        # every cell, the metric distance to the nearest occupied cell.
         occupied = np.zeros((self.cells, self.cells), dtype=bool)
         ox_idx = ((obs_x - self.minx) / self.reso).astype(np.intp)
         oy_idx = ((obs_y - self.miny) / self.reso).astype(np.intp)
@@ -243,12 +272,23 @@ class FixedGaussianGridMap:
         if not occupied.any():
             return False  # all obstacles fell outside the window → no cost layer
 
-        # Distance (in cells) from each cell to the nearest occupied cell, ×reso
-        # → metres. EDT computes distance to the nearest *False*-in-inverted, i.e.
-        # nearest occupied cell.
         min_dists = distance_transform_edt(~occupied) * self.reso
 
-        self.gmap = (1.0 - norm.cdf(min_dists, 0.0, self.std)).astype(np.float32)
+        # Lethal core: within robot_radius → 1.0 (hard block; > obstacle_threshold
+        # so A* never enters). Soft band: decays from soft_cost_max (just below
+        # threshold, so traversable but penalised) to 0 at inflation_radius.
+        gmap = np.zeros((self.cells, self.cells), dtype=np.float32)
+        lethal = min_dists <= self.robot_radius
+        gmap[lethal] = 1.0
+        if self.inflation_radius > self.robot_radius:
+            band = (~lethal) & (min_dists <= self.inflation_radius)
+            # 1/e falloff scaled so the band spans ~3 decay lengths.
+            decay_len = max((self.inflation_radius - self.robot_radius) / 3.0, 1e-3)
+            d_band = min_dists[band] - self.robot_radius
+            gmap[band] = (
+                self.soft_cost_max * np.exp(-d_band / decay_len)
+            ).astype(np.float32)
+        self.gmap = gmap
         return True
 
     # ------------------------------------------------------------------

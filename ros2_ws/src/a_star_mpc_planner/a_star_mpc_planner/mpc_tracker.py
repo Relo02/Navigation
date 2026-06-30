@@ -277,10 +277,8 @@ class MPCTracker:
         p_vy_max    = opti.parameter()
         p_omega_max = opti.parameter()
 
-        # Weight matrices — only position/yaw tracked, velocity states free
-        q   = np.array([cfg.Q_x, cfg.Q_y, cfg.Q_yaw, 0.0, 0.0, 0.0])
-        Q   = np.diag(q)
-        Q_T = np.diag(q * cfg.Q_terminal)
+        # Position/yaw tracking. Yaw error must be wrap-aware: a +179 deg vs
+        # -179 deg reference is a 2 deg error, not a 358 deg spin request.
         R   = np.diag([cfg.R_vx, cfg.R_vy, cfg.R_omega])
 
         # ── Objective ────────────────────────────────────────────────
@@ -288,8 +286,11 @@ class MPCTracker:
 
         for k in range(N):
             # Position + yaw tracking
-            e    = X[:, k] - p_xref[:, k]
-            cost += ca.mtimes([e.T, Q, e])
+            ex = X[0, k] - p_xref[0, k]
+            ey = X[1, k] - p_xref[1, k]
+            eyaw_raw = X[2, k] - p_xref[2, k]
+            eyaw = ca.atan2(ca.sin(eyaw_raw), ca.cos(eyaw_raw))
+            cost += cfg.Q_x * ex ** 2 + cfg.Q_y * ey ** 2 + cfg.Q_yaw * eyaw ** 2
 
             # Control effort
             u_k   = U[:, k]
@@ -312,8 +313,13 @@ class MPCTracker:
                 cost        += cfg.W_obs_sigmoid * 2.0 * penetration ** 2
 
         # Terminal cost
-        e_T   = X[:, N] - p_xref[:, N]
-        cost += ca.mtimes([e_T.T, Q_T, e_T])
+        ex_T = X[0, N] - p_xref[0, N]
+        ey_T = X[1, N] - p_xref[1, N]
+        eyaw_T_raw = X[2, N] - p_xref[2, N]
+        eyaw_T = ca.atan2(ca.sin(eyaw_T_raw), ca.cos(eyaw_T_raw))
+        cost += cfg.Q_terminal * (
+            cfg.Q_x * ex_T ** 2 + cfg.Q_y * ey_T ** 2 + cfg.Q_yaw * eyaw_T ** 2
+        )
 
         for j in range(n_obs):
             dist_T      = ca.sqrt(

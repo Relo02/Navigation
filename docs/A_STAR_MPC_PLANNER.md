@@ -54,6 +54,10 @@ never sees the goal — it only tracks `(vx, vy, yaw_rate)`.
 | `/mpc/next_setpoint` | `geometry_msgs/PoseStamped` | lookahead setpoint |
 | **`/mpc/cmd_vel`** | `geometry_msgs/Twist` | **the velocity command** → AMO via the WS bridge |
 | `/mpc/diagnostics` | `std_msgs/Float64MultiArray` | `[success, cost, solve_ms, avg_ms, fails, security, vx_eff]` |
+| `/navigation/state` | `std_msgs/String` | nav state machine: `IDLE`/`NAVIGATING`/`GOAL_REACHED`/`SECURITY`/`STOPPED` |
+| `/mpc/predicted_obstacles` | `visualization_msgs/MarkerArray` | obstacle spheres at predicted positions (RViz) |
+| `/mpc/obstacle_velocities` | `visualization_msgs/MarkerArray` | velocity-vector ARROW per **dynamic** obstacle cluster (RViz) |
+| `/estop` (sub) | `std_msgs/Bool` | latched manual e-stop; the AMO bridge forwards zero velocity while true |
 
 ---
 
@@ -117,7 +121,29 @@ ros2 launch a_star_mpc_planner planner.launch.py amo_host:=192.168.1.10 amo_port
 
 To start **both** the localization and planner launches at once (as two separate
 processes, with the DLIO-init delay and clean Ctrl-C teardown), use the wrapper
-`ros2_ws/src/autonomy.sh` instead of running the two `ros2 launch` lines by hand.
+`ros2_ws/autonomy.sh` instead of running the two `ros2 launch` lines by hand.
+
+### Reading the logs (DLIO vs planner, separately)
+
+When run by hand (above), each `ros2 launch` already owns its own terminal, so
+the DLIO/perception logs and the A\*+MPC planner logs are naturally separate.
+
+`autonomy.sh` runs both from one terminal, so it instead writes each launch's
+stdout+stderr to its **own** logfile under `ros2_ws/logs/` rather than
+interleaving them on screen. Follow each independently:
+
+```bash
+tail -f ros2_ws/logs/localization_latest.log   # DLIO + g1_local_map
+tail -f ros2_ws/logs/planner_latest.log        # a_star_node + mpc_node (+ WS bridge)
+```
+
+`*_latest.log` symlinks track the newest run; timestamped files are kept beside
+them. Env overrides: `LOG_DIR=/path` relocates the logs; `LOG_TO_CONSOLE=1` also
+mirrors both streams to the launching terminal (re-interleaving them). The
+planner log is where the navigation **state machine** surfaces — `[MPC]`
+state transitions and `/navigation/state` (`IDLE` / `NAVIGATING` /
+`GOAL_REACHED` / `SECURITY` / `STOPPED`), `[MPC-SECURITY]` escape events,
+`[MPC-STOP]` fail-safe stops, and the per-cycle solve line.
 
 Then start the gait in **autonomous** mode (amo_policy container):
 
@@ -148,6 +174,32 @@ the DLIO odom/cloud/map, the local voxel map + costmap, and the planner layers:
 **GlobalGoal** (`/global_goal`), and a toggleable **AStarCostGrid**
 (`/a_star/occupancy_grid`).
 
+To visualise **dynamic obstacles**, add two `MarkerArray` displays:
+`/mpc/predicted_obstacles` (spheres at each obstacle's predicted position) and
+`/mpc/obstacle_velocities` (a magenta **velocity-vector arrow + speed label** for
+every cluster the tracker classifies as *moving*). Static structure produces no
+arrow, so an arrow appearing = something is actually moving; the arrow points
+along the tracked velocity and its length is `speed * mpc_vel_arrow_scale`
+seconds (default 1 s, so 1 m/s ⇒ a 1 m arrow). Quick check without RViz:
+`ros2 topic echo /mpc/obstacle_velocities`.
+
+### Safety e-stop (`s` / `g` keys)
+When started via `ros2_ws/autonomy.sh`, that terminal runs a keyboard e-stop
+(`g1_sim_bridge/estop_keyboard_node`) that publishes a latched `/estop`:
+
+- **`s` + Enter — STOP**: the `cmd_vel→AMO` bridge forwards **zero** velocity to
+  the gait regardless of `/mpc/cmd_vel`; the robot halts and holds in place.
+- **`g` + Enter — GO**: releases `/estop`; the bridge resumes forwarding the
+  MPC velocity and the robot continues toward the current goal.
+
+It is a *soft, reversible* stop (halt then resume without restarting anything),
+and is independent of the automatic fail-safes (MPC zeroes on stale pose/path;
+the bridge zeroes on a stale `/mpc/cmd_vel`). The e-stop has top priority at the
+bridge, so **while it is engaged the robot will not move even if you send a new
+goal** — the planner still replans to the new goal (you'll see the path and
+`NAVIGATING` state), but no velocity reaches the gait until you press `g`. Run it
+standalone with `ros2 run g1_sim_bridge estop_keyboard_node`.
+
 ---
 
 ## 5. Tuning
@@ -177,6 +229,10 @@ the ROS 2 / `localization` image. Build the workspace in-container (`build_ws`).
 - `ros2 topic echo /a_star/path --once` — A\* is producing a path to the goal.
 - `ros2 topic echo /mpc/cmd_vel --once` — the MPC is emitting a velocity.
 - `ros2 topic echo /mpc/diagnostics` — `success`/`solve_ms` healthy, `security` 0.
+- `ros2 topic echo /navigation/state` — `NAVIGATING` while driving, `GOAL_REACHED`
+  on arrival (latched zero-velocity hold), `STOPPED` ⇒ stale pose/path fail-safe.
+- Reading logs under `autonomy.sh`: `tail -f ros2_ws/logs/planner_latest.log`
+  (A\*+MPC) and `tail -f ros2_ws/logs/localization_latest.log` (DLIO) — see §4.
 - AMO log: `command source: websocket :8766` and `connected to AMO WebSocket`
   from the bridge ⇒ velocity is reaching the gait.
 - Verify clouds/paths in **RViz**, not `ros2 topic hz` from the host (a fresh CLI

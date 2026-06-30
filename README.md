@@ -171,13 +171,50 @@ ros2 launch a_star_mpc_planner planner.launch.py
 *Option B — one command, both as separate processes (Ctrl-C stops both):*
 
 ```bash
-ros2_ws/src/autonomy.sh        # runs both launches; PLANNER_DELAY=3 by default
+ros2_ws/autonomy.sh            # runs both launches; PLANNER_DELAY=3 by default
 ```
 
 `autonomy.sh` just starts the same two launch files as independent processes
 (ROS 2 launch already runs each launch's nodes concurrently — no manual
 threading), waits `PLANNER_DELAY` s between them for DLIO init, and tears both
 down together on Ctrl-C. It is the all-in-one equivalent of Option A.
+
+**Reading the logs separately.** Because both launches run from one terminal,
+`autonomy.sh` sends each launch's output to its **own** logfile (under
+`ros2_ws/logs/`) instead of interleaving DLIO and planner lines on screen. Tail
+them independently — one perception view, one planner view:
+
+```bash
+tail -f ros2_ws/logs/localization_latest.log   # DLIO + g1_local_map
+tail -f ros2_ws/logs/planner_latest.log        # A* node + MPC node (+ WS bridge)
+```
+
+The `*_latest.log` symlinks always point at the newest run (timestamped files
+are kept alongside). Overrides: `LOG_DIR=/path ros2_ws/autonomy.sh` to relocate
+the logs, `LOG_TO_CONSOLE=1` to also mirror both streams to the launching
+terminal (they interleave again). The planner log carries the navigation state
+machine (`/navigation/state`: `IDLE`/`NAVIGATING`/`GOAL_REACHED`/`SECURITY`/
+`STOPPED`), `[MPC-SECURITY]` and `[MPC-STOP]` events, and per-cycle solve
+diagnostics. (Option A keeps the classic one-stack-per-terminal layout, so its
+logs are already separate.)
+
+**Keyboard safety e-stop.** The `autonomy.sh` terminal stays interactive and
+acts as a soft e-stop — it publishes a latched `/estop` that the `cmd_vel→AMO`
+bridge obeys by forwarding **zero velocity** to the gait:
+
+| key | effect |
+|---|---|
+| `s` + Enter | **STOP** — zero velocity to the gait, robot holds in place |
+| `g` + Enter | **GO** — release the e-stop, navigation resumes |
+| `q` + Enter | quit `autonomy.sh` (engages the e-stop, then stops everything) |
+
+It's a *safe* stop, not a kill: `s` then `g` lets you halt and re-enable the
+mission without restarting anything. It complements (doesn't replace) the
+automatic fail-safes — the MPC zeroes on stale pose/path and the bridge zeroes
+on a stale `/mpc/cmd_vel`, so a crash also stops the robot. Set
+`DISABLE_ESTOP_KEYS=1` to fall back to Ctrl-C-only. (The bridge runs in the
+`planner` launch, so this needs the planner up; with Option A run the helper
+yourself: `ros2 run g1_sim_bridge estop_keyboard_node`.)
 
 **Then start the gait** (in the `amo_policy` container) and send a goal:
 

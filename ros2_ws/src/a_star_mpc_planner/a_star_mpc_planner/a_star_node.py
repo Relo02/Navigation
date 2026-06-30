@@ -74,6 +74,25 @@ from a_star_mpc_planner.persistent_map import PersistentOccupancyMap
 from a_star_mpc_planner.slam_map_utils import extract_slam_obstacle_points
 
 
+def read_xyz(msg: PointCloud2) -> np.ndarray:
+    """Vectorised (N, 3) float xyz extraction from a PointCloud2.
+
+    Replaces the per-point Python list comprehension
+    ``np.array([(p[0], p[1], p[2]) for p in read_points(...)])`` — which on a
+    dense voxel cloud iterated tens of thousands of times in Python every
+    cycle — with a single structured-array column stack (issue #3). Returns an
+    empty (0, 3) array for an empty cloud.
+    """
+    rec = point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+    if not isinstance(rec, np.ndarray):
+        rec = np.array(list(rec))
+    if rec.size == 0:
+        return np.empty((0, 3), dtype=float)
+    if rec.dtype.names:
+        return np.column_stack([rec['x'], rec['y'], rec['z']]).astype(float)
+    return rec.astype(float).reshape(-1, 3)
+
+
 class AStarNode(Node):
 
     def __init__(self):
@@ -87,6 +106,15 @@ class AStarNode(Node):
         self.declare_parameter('grid_reso',             0.25)
         self.declare_parameter('grid_half_width',       5.0)
         self.declare_parameter('grid_std',              0.4)
+        # Robot-radius inflation for the local costmap (issue #2). lethal core =
+        # robot_radius (hard block → guaranteed clearance), soft penalty band out
+        # to inflation_radius so A* paths stop hugging walls.
+        self.declare_parameter('robot_radius',          0.30)
+        self.declare_parameter('inflation_radius',      0.60)
+        # Publish the 3D voxel layer for RViz. OFF by default: allocating the
+        # cells*cells*cells_z voxel grid every replan was the biggest per-cycle
+        # cost in the stack (issue #3). Enable only for 3D debugging.
+        self.declare_parameter('publish_voxel_grid',    False)
         self.declare_parameter('obstacle_threshold',    0.5)
         self.declare_parameter('obstacle_cost_weight', 10.0)
         self.declare_parameter('replan_rate_hz',        2.0)
@@ -223,6 +251,11 @@ class AStarNode(Node):
         self._slam_map_max_age = float(self.get_parameter('slam_map_max_age_sec').value)
 
         # ── Algorithm objects ─────────────────────────────────────────
+        # hmap is only needed for the 2.5D step-over rule; vmap only for the
+        # optional voxel-grid RViz layer. Skip building either when unused so the
+        # large per-cycle allocations disappear (issue #3).
+        _step_over_h = float(self.get_parameter('step_over_height').value)
+        _publish_voxels = bool(self.get_parameter('publish_voxel_grid').value)
         self._grid_map = FixedGaussianGridMap(
             reso=float(self.get_parameter('grid_reso').value),
             half_width=float(self.get_parameter('grid_half_width').value),
@@ -231,6 +264,10 @@ class AStarNode(Node):
             z_max=float(self.get_parameter('voxel_z_max').value),
             ground_segment_height=float(self.get_parameter('ground_segment_height').value),
             ground_segment_en=bool(self.get_parameter('ground_segment_en').value),
+            robot_radius=float(self.get_parameter('robot_radius').value),
+            inflation_radius=float(self.get_parameter('inflation_radius').value),
+            build_hmap=_step_over_h > 0.0,
+            build_vmap=_publish_voxels,
         )
         self._planner = AStarPlanner(
             obstacle_threshold=float(self.get_parameter('obstacle_threshold').value),
@@ -491,15 +528,14 @@ class AStarNode(Node):
         eventually decays stale cells.
         """
         try:
-            points = list(point_cloud2.read_points(msg, skip_nans=True))
+            arr = read_xyz(msg)
         except Exception as e:
             self.get_logger().warn(f'Lidar parsing error: {e}')
             return
 
         # type: np.ndarray | None
         new_pts = None
-        if points:
-            arr = np.array([(p[0], p[1], p[2]) for p in points], dtype=float)
+        if len(arr) > 0:
             if self._pose is not None:
                 px = self._pose.pose.position.x
                 py = self._pose.pose.position.y
@@ -567,12 +603,12 @@ class AStarNode(Node):
     def _dlio_map_cb(self, msg: PointCloud2) -> None:
         """Cache DLIO's global 3D map (/dlio/map_node/map) as an (N,3) array."""
         try:
-            pts = list(point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True))
+            pts = read_xyz(msg)
         except Exception as exc:
             self.get_logger().warning(f'[A*-DLIO] map parse error: {exc}', throttle_duration_sec=5.0)
             return
-        if pts:
-            self._dlio_map_pts = np.array([(p[0], p[1], p[2]) for p in pts], dtype=np.float32)
+        if len(pts) > 0:
+            self._dlio_map_pts = pts.astype(np.float32)
             self._dlio_map_t   = self.get_clock().now().nanoseconds * 1e-9
             self.get_logger().debug(
                 f'[A*-DLIO] map updated: {len(self._dlio_map_pts)} pts',
